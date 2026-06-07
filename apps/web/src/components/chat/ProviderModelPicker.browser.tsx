@@ -1,5 +1,4 @@
 import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
-import { EnvironmentId } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { page, userEvent } from "vite-plus/test/browser";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -18,63 +17,6 @@ import {
   type UnifiedSettings,
 } from "@t3tools/contracts/settings";
 import { __resetLocalApiForTests } from "../../localApi";
-
-// Mock the environments/runtime module to provide a mock primary environment connection
-vi.mock("../../environments/runtime", () => {
-  const primaryConnection = {
-    kind: "primary" as const,
-    knownEnvironment: {
-      id: "environment-local",
-      label: "Local environment",
-      source: "manual" as const,
-      environmentId: EnvironmentId.make("environment-local"),
-      target: {
-        httpBaseUrl: "http://localhost:3000",
-        wsBaseUrl: "ws://localhost:3000",
-      },
-    },
-    environmentId: EnvironmentId.make("environment-local"),
-    client: {
-      server: {
-        getConfig: vi.fn(),
-        updateSettings: vi.fn(),
-      },
-    },
-    ensureBootstrapped: async () => undefined,
-    reconnect: async () => undefined,
-    dispose: async () => undefined,
-  };
-
-  return {
-    getEnvironmentHttpBaseUrl: () => "http://localhost:3000",
-    getSavedEnvironmentRecord: () => null,
-    getSavedEnvironmentRuntimeState: () => null,
-    hasSavedEnvironmentRegistryHydrated: () => true,
-    listSavedEnvironmentRecords: () => [],
-    resetSavedEnvironmentRegistryStoreForTests: vi.fn(),
-    resetSavedEnvironmentRuntimeStoreForTests: vi.fn(),
-    resolveEnvironmentHttpUrl: (_environmentId: unknown, path: string) =>
-      new URL(path, "http://localhost:3000").toString(),
-    waitForSavedEnvironmentRegistryHydration: async () => undefined,
-    addSavedEnvironment: vi.fn(),
-    disconnectSavedEnvironment: vi.fn(),
-    ensureEnvironmentConnectionBootstrapped: async () => undefined,
-    getPrimaryEnvironmentConnection: () => primaryConnection,
-    readEnvironmentConnection: () => primaryConnection,
-    reconnectSavedEnvironment: vi.fn(),
-    removeSavedEnvironment: vi.fn(),
-    requireEnvironmentConnection: () => primaryConnection,
-    resetEnvironmentServiceForTests: vi.fn(),
-    startEnvironmentConnectionService: vi.fn(),
-    subscribeEnvironmentConnections: () => () => {},
-    useSavedEnvironmentRegistryStore: (
-      selector: (state: { byId: Record<string, never> }) => unknown,
-    ) => selector({ byId: {} }),
-    useSavedEnvironmentRuntimeStore: (
-      selector: (state: { byId: Record<string, never> }) => unknown,
-    ) => selector({ byId: {} }),
-  };
-});
 
 function selectDescriptor(
   id: string,

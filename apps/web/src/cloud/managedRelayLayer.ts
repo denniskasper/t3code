@@ -39,19 +39,23 @@ export const webRelayDpopSignerLayer = Layer.effect(
         return generated;
       }),
     );
-    const signerError = (cause: unknown) => new ManagedRelayDpopSignerError({ cause });
+
     return ManagedRelayDpopSigner.of({
       thumbprint: loadOrCreateBrowserDpopKey.pipe(
         Effect.map((proofKey) => proofKey.thumbprint),
-        Effect.mapError(signerError),
+        Effect.mapError((cause) => new ManagedRelayDpopSignerError({ cause })),
+        Effect.withSpan("web.managedRelayDpopSigner.loadThumbprint"),
       ),
-      createProof: (input) =>
-        loadOrCreateBrowserDpopKey.pipe(
-          Effect.flatMap((proofKey) => createBrowserDpopProof({ ...input, proofKey })),
-          Effect.provideService(Crypto.Crypto, crypto),
-          Effect.map((proof) => proof.proof),
-          Effect.mapError(signerError),
-        ),
+      createProof: Effect.fn("web.managedRelayDpopSigner.createProof")(
+        function* (input) {
+          const proofKey = yield* loadOrCreateBrowserDpopKey;
+          return yield* createBrowserDpopProof({ ...input, proofKey }).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.map((proof) => proof.proof),
+          );
+        },
+        Effect.mapError((cause) => new ManagedRelayDpopSignerError({ cause })),
+      ),
     });
   }),
 );

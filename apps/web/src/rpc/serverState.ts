@@ -14,7 +14,6 @@ import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { Atom } from "effect/unstable/reactivity";
 import { useCallback, useRef } from "react";
 
-import type { WsRpcClient } from "@t3tools/client-runtime";
 import { appAtomRegistry, resetAppAtomRegistryForTests } from "./atomRegistry";
 
 export type ServerConfigUpdateSource = ServerConfigStreamEvent["type"];
@@ -24,11 +23,6 @@ export interface ServerConfigUpdatedNotification {
   readonly payload: ServerConfigUpdatedPayload;
   readonly source: ServerConfigUpdateSource;
 }
-
-type ServerStateClient = Pick<
-  WsRpcClient["server"],
-  "getConfig" | "subscribeConfig" | "subscribeLifecycle"
->;
 
 function makeStateAtom<A>(label: string, initialValue: A) {
   return Atom.make(initialValue).pipe(Atom.keepAlive, Atom.withLabel(label));
@@ -170,39 +164,6 @@ export function onProvidersUpdated(
   listener: (payload: ServerProviderUpdatedPayload) => void,
 ): () => void {
   return subscribeLatest(providersUpdatedAtom, listener);
-}
-
-export function startServerStateSync(client: ServerStateClient): () => void {
-  let disposed = false;
-  const cleanups = [
-    client.subscribeLifecycle((event) => {
-      if (event.type === "welcome") {
-        emitWelcome(event.payload);
-      }
-    }),
-    client.subscribeConfig((event) => {
-      applyServerConfigEvent(event);
-    }),
-  ];
-
-  if (getServerConfig() === null) {
-    void client
-      .getConfig()
-      .then((config) => {
-        if (disposed || getServerConfig() !== null) {
-          return;
-        }
-        setServerConfigSnapshot(config);
-      })
-      .catch(() => undefined);
-  }
-
-  return () => {
-    disposed = true;
-    for (const cleanup of cleanups) {
-      cleanup();
-    }
-  };
 }
 
 export function resetServerStateForTests() {

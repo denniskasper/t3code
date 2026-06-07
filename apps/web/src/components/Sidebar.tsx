@@ -60,11 +60,10 @@ import {
   type SidebarThreadPreviewCount,
   type SidebarThreadSortOrder,
 } from "@t3tools/contracts/settings";
-import { usePrimaryEnvironmentId } from "../environments/primary";
 import { isElectron } from "../env";
 import { APP_STAGE_LABEL, APP_VERSION } from "../branding";
 import { isTerminalFocused } from "../lib/terminalFocus";
-import { isMacPlatform, newCommandId } from "../lib/utils";
+import { isMacPlatform } from "../lib/utils";
 import {
   selectProjectByRef,
   selectProjectsAcrossEnvironments,
@@ -74,7 +73,7 @@ import {
   useStore,
 } from "../store";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
-import { useThreadRunningTerminalIds } from "../terminalSessionState";
+import { useWebThreadRunningTerminalIds as useThreadRunningTerminalIds } from "../connection/webTerminalSessions";
 import { useUiStateStore } from "../uiStateStore";
 import {
   resolveShortcutCommand,
@@ -90,9 +89,10 @@ import { useVcsStatus } from "../lib/vcsStatusState";
 import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
-import { retainThreadDetailSubscription } from "../environments/runtime/service";
 
 import { useThreadActions } from "../hooks/useThreadActions";
+import { useWebActions, useWebEnvironmentThread } from "../connection/useWebEnvironmentData";
+import { useWebEnvironments, useWebPrimaryEnvironment } from "../connection/useWebEnvironments";
 import {
   buildThreadRouteParams,
   resolveThreadRouteRef,
@@ -177,7 +177,6 @@ import { sortThreads } from "../lib/threadSort";
 import { SidebarUpdatePill } from "./sidebar/SidebarUpdatePill";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { CommandDialogTrigger } from "./ui/command";
-import { readEnvironmentApi } from "../environmentApi";
 import { useSettings, useUpdateSettings } from "~/hooks/useSettings";
 import { useServerKeybindings } from "../rpc/serverState";
 import {
@@ -186,10 +185,6 @@ import {
   getProjectOrderKey,
   selectProjectGroupingSettings,
 } from "../logicalProject";
-import {
-  useSavedEnvironmentRegistryStore,
-  useSavedEnvironmentRuntimeStore,
-} from "../environments/runtime";
 import type { SidebarThreadSummary } from "../types";
 import {
   buildPhysicalToLogicalProjectKeyMap,
@@ -217,6 +212,11 @@ const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> =
   repository_path: "Group by repository path",
   separate: "Keep separate",
 };
+
+function SidebarThreadDetailPrewarmer({ threadRef }: { readonly threadRef: ScopedThreadRef }) {
+  useWebEnvironmentThread(threadRef.environmentId, threadRef.threadId);
+  return null;
+}
 
 function clampSidebarThreadPreviewCount(value: number): SidebarThreadPreviewCount {
   return Math.min(
@@ -347,18 +347,14 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     environmentId: thread.environmentId,
     threadId: thread.id,
   });
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const { environments } = useWebEnvironments();
+  const primaryEnvironmentId = useWebPrimaryEnvironment()?.environmentId ?? null;
   const isRemoteThread =
     primaryEnvironmentId !== null && thread.environmentId !== primaryEnvironmentId;
-  const remoteEnvLabel = useSavedEnvironmentRuntimeStore(
-    (s) => s.byId[thread.environmentId]?.descriptor?.label ?? null,
-  );
-  const remoteEnvSavedLabel = useSavedEnvironmentRegistryStore(
-    (s) => s.byId[thread.environmentId]?.label ?? null,
-  );
-  const threadEnvironmentLabel = isRemoteThread
-    ? (remoteEnvLabel ?? remoteEnvSavedLabel ?? "Remote")
-    : null;
+  const remoteEnvLabel =
+    environments.find((environment) => environment.environmentId === thread.environmentId)?.label ??
+    null;
+  const threadEnvironmentLabel = isRemoteThread ? (remoteEnvLabel ?? "Remote") : null;
   // For grouped projects, the thread may belong to a different environment
   // than the representative project.  Look up the thread's own project cwd
   // so git status (and thus PR detection) queries the correct path.
@@ -943,6 +939,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     (settings) => settings.defaultThreadEnvMode,
   );
   const projectGroupingSettings = useSettings(selectProjectGroupingSettings);
+  const actions = useWebActions();
   const { updateSettings } = useUpdateSettings();
   const sidebarThreadPreviewCount = useSettings<SidebarThreadPreviewCount>(
     (settings) => settings.sidebarThreadPreviewCount,
@@ -1297,19 +1294,15 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
       draftStore.clearProjectDraftThreadId(memberProjectRef);
 
-      const projectApi = readEnvironmentApi(member.environmentId);
-      if (!projectApi) {
-        throw new Error("Project API unavailable.");
-      }
-
-      await projectApi.orchestration.dispatchCommand({
-        type: "project.delete",
-        commandId: newCommandId(),
-        projectId: member.id,
-        ...(options.force === true ? { force: true } : {}),
+      await actions.projects.delete({
+        environmentId: member.environmentId,
+        input: {
+          projectId: member.id,
+          ...(options.force === true ? { force: true } : {}),
+        },
       });
     },
-    [],
+    [actions.projects],
   );
 
   const handleRemoveProject = useCallback(
@@ -1789,17 +1782,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         finishRename();
         return;
       }
-      const api = readEnvironmentApi(threadRef.environmentId);
-      if (!api) {
-        finishRename();
-        return;
-      }
       try {
-        await api.orchestration.dispatchCommand({
-          type: "thread.meta.update",
-          commandId: newCommandId(),
-          threadId: threadRef.threadId,
-          title: trimmed,
+        await actions.threads.updateMetadata({
+          environmentId: threadRef.environmentId,
+          input: {
+            threadId: threadRef.threadId,
+            title: trimmed,
+          },
         });
       } catch (error) {
         toastManager.add(
@@ -1812,7 +1801,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
       finishRename();
     },
-    [],
+    [actions.threads],
   );
 
   const closeProjectRenameDialog = useCallback(() => {
@@ -1839,24 +1828,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       return;
     }
 
-    const api = readEnvironmentApi(projectRenameTarget.environmentId);
-    if (!api) {
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Failed to rename project",
-          description: "Project API unavailable.",
-        }),
-      );
-      return;
-    }
-
     try {
-      await api.orchestration.dispatchCommand({
-        type: "project.meta.update",
-        commandId: newCommandId(),
-        projectId: projectRenameTarget.id,
-        title: trimmed,
+      await actions.projects.update({
+        environmentId: projectRenameTarget.environmentId,
+        input: {
+          projectId: projectRenameTarget.id,
+          title: trimmed,
+        },
       });
       closeProjectRenameDialog();
     } catch (error) {
@@ -1868,7 +1846,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         }),
       );
     }
-  }, [closeProjectRenameDialog, projectRenameTarget, projectRenameTitle]);
+  }, [actions.projects, closeProjectRenameDialog, projectRenameTarget, projectRenameTitle]);
 
   const closeProjectGroupingDialog = useCallback(() => {
     setProjectGroupingTarget(null);
@@ -2825,9 +2803,15 @@ export default function Sidebar() {
   const platform = navigator.platform;
   const shortcutModifiers = useShortcutModifierState();
   const modelPickerOpen = useModelPickerOpen();
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const savedEnvironmentRegistry = useSavedEnvironmentRegistryStore((s) => s.byId);
-  const savedEnvironmentRuntimeById = useSavedEnvironmentRuntimeStore((s) => s.byId);
+  const { environments } = useWebEnvironments();
+  const primaryEnvironmentId = useWebPrimaryEnvironment()?.environmentId ?? null;
+  const environmentLabelById = useMemo(
+    () =>
+      new Map(
+        environments.map((environment) => [environment.environmentId, environment.label] as const),
+      ),
+    [environments],
+  );
   const orderedProjects = useMemo(() => {
     return orderItemsByPreferredIds({
       items: projects,
@@ -2861,19 +2845,9 @@ export default function Sidebar() {
       projects: orderedProjects,
       settings: projectGroupingSettings,
       primaryEnvironmentId,
-      resolveEnvironmentLabel: (environmentId) => {
-        const rt = savedEnvironmentRuntimeById[environmentId];
-        const saved = savedEnvironmentRegistry[environmentId];
-        return rt?.descriptor?.label ?? saved?.label ?? null;
-      },
+      resolveEnvironmentLabel: (environmentId) => environmentLabelById.get(environmentId) ?? null,
     });
-  }, [
-    orderedProjects,
-    projectGroupingSettings,
-    primaryEnvironmentId,
-    savedEnvironmentRegistry,
-    savedEnvironmentRuntimeById,
-  ]);
+  }, [environmentLabelById, orderedProjects, projectGroupingSettings, primaryEnvironmentId]);
 
   const sidebarProjectByKey = useMemo(
     () => new Map(sidebarProjects.map((project) => [project.projectKey, project] as const)),
@@ -3180,18 +3154,6 @@ export default function Sidebar() {
   );
 
   useEffect(() => {
-    const releases = prewarmedSidebarThreadRefs.map((ref) =>
-      retainThreadDetailSubscription(ref.environmentId, ref.threadId),
-    );
-
-    return () => {
-      for (const release of releases) {
-        release();
-      }
-    };
-  }, [prewarmedSidebarThreadRefs]);
-
-  useEffect(() => {
     updateThreadJumpHintsVisibility(shouldShowThreadJumpHintsNow);
   }, [shouldShowThreadJumpHintsNow, updateThreadJumpHintsVisibility]);
 
@@ -3415,6 +3377,9 @@ export default function Sidebar() {
 
   return (
     <>
+      {prewarmedSidebarThreadRefs.map((threadRef) => (
+        <SidebarThreadDetailPrewarmer key={scopedThreadKey(threadRef)} threadRef={threadRef} />
+      ))}
       <SidebarChromeHeader isElectron={isElectron} />
 
       {isOnSettings ? (

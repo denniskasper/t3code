@@ -9,34 +9,38 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import { createDpopProof, loadOrCreateDpopProofKeyPair } from "./dpop";
+import { mobileManagedRelayAccessTokenStore } from "./managedRelayTokenStore";
 
 const mobileRelayDpopSignerLayer = Layer.effect(
   ManagedRelayDpopSigner,
   Effect.gen(function* () {
     const crypto = yield* Crypto.Crypto;
+    const loadProofKey = yield* Effect.cached(
+      loadOrCreateDpopProofKeyPair().pipe(Effect.provideService(Crypto.Crypto, crypto)),
+    );
     return ManagedRelayDpopSigner.of({
-      thumbprint: Effect.suspend(() =>
-        loadOrCreateDpopProofKeyPair().pipe(
-          Effect.provideService(Crypto.Crypto, crypto),
-          Effect.map((proofKey) => proofKey.thumbprint),
-          Effect.mapError((cause) => new ManagedRelayDpopSignerError({ cause })),
-        ),
+      thumbprint: loadProofKey.pipe(
+        Effect.map((proofKey) => proofKey.thumbprint),
+        Effect.mapError((cause) => new ManagedRelayDpopSignerError({ cause })),
+        Effect.withSpan("mobile.managedRelayDpopSigner.loadThumbprint"),
       ),
-      createProof: (input) =>
-        Effect.gen(function* () {
-          const proofKey = yield* loadOrCreateDpopProofKeyPair().pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-          );
+      createProof: Effect.fn("mobile.managedRelayDpopSigner.createProof")(
+        function* (input) {
+          const proofKey = yield* loadProofKey;
           return yield* createDpopProof({ ...input, proofKey }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             Effect.map((proof) => proof.proof),
           );
-        }).pipe(Effect.mapError((cause) => new ManagedRelayDpopSignerError({ cause }))),
+        },
+        Effect.mapError((cause) => new ManagedRelayDpopSignerError({ cause })),
+      ),
     });
   }),
 );
 
 export const mobileManagedRelayClientLayer = (relayUrl: string) =>
-  managedRelayClientLayer({ relayUrl, clientId: RelayMobileClientId }).pipe(
-    Layer.provideMerge(mobileRelayDpopSignerLayer),
-  );
+  managedRelayClientLayer({
+    relayUrl,
+    clientId: RelayMobileClientId,
+    accessTokenStore: mobileManagedRelayAccessTokenStore,
+  }).pipe(Layer.provideMerge(mobileRelayDpopSignerLayer));

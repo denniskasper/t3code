@@ -22,6 +22,8 @@ import { ensureLocalApi } from "~/localApi";
 import * as Struct from "effect/Struct";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import { applySettingsUpdated, getServerConfig, useServerSettings } from "~/rpc/serverState";
+import { useWebActions } from "~/connection/useWebEnvironmentData";
+import { useWebPrimaryEnvironment } from "~/connection/useWebEnvironments";
 
 const CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE = "[CLIENT_SETTINGS]";
 
@@ -193,25 +195,34 @@ export function useSettings<T = UnifiedSettings>(selector?: (s: UnifiedSettings)
  * persisted via RPC. Client keys go through client persistence.
  */
 export function useUpdateSettings() {
-  const updateSettings = useCallback((patch: Partial<UnifiedSettings>) => {
-    const { serverPatch, clientPatch } = splitPatch(patch);
+  const actions = useWebActions();
+  const primaryEnvironment = useWebPrimaryEnvironment();
+  const updateSettings = useCallback(
+    (patch: Partial<UnifiedSettings>) => {
+      const { serverPatch, clientPatch } = splitPatch(patch);
 
-    if (Object.keys(serverPatch).length > 0) {
-      const currentServerConfig = getServerConfig();
-      if (currentServerConfig) {
-        applySettingsUpdated(applyServerSettingsPatch(currentServerConfig.settings, serverPatch));
+      if (Object.keys(serverPatch).length > 0) {
+        const currentServerConfig = getServerConfig();
+        if (currentServerConfig) {
+          applySettingsUpdated(applyServerSettingsPatch(currentServerConfig.settings, serverPatch));
+        }
+        if (primaryEnvironment) {
+          void actions.server.updateSettings({
+            environmentId: primaryEnvironment.environmentId,
+            input: { patch: serverPatch },
+          });
+        }
       }
-      // Fire-and-forget RPC — push will reconcile on success
-      void ensureLocalApi().server.updateSettings(serverPatch);
-    }
 
-    if (Object.keys(clientPatch).length > 0) {
-      persistClientSettings({
-        ...getClientSettingsSnapshot(),
-        ...clientPatch,
-      });
-    }
-  }, []);
+      if (Object.keys(clientPatch).length > 0) {
+        persistClientSettings({
+          ...getClientSettingsSnapshot(),
+          ...clientPatch,
+        });
+      }
+    },
+    [actions.server, primaryEnvironment],
+  );
 
   const resetSettings = useCallback(() => {
     updateSettings(DEFAULT_UNIFIED_SETTINGS);

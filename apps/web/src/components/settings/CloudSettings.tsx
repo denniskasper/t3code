@@ -101,7 +101,15 @@ function CloudSettingsPanelInner() {
   const updatePublishAgentActivity = async (enabled: boolean) => {
     setIsUpdatingPreference(true);
     try {
-      await webRuntime.runPromise(updatePrimaryCloudPreferences({ publishAgentActivity: enabled }));
+      if (!primaryLinkState.target) {
+        throw new Error("Local environment is not ready yet.");
+      }
+      await webRuntime.runPromise(
+        updatePrimaryCloudPreferences({
+          target: primaryLinkState.target,
+          publishAgentActivity: enabled,
+        }),
+      );
       primaryLinkState.refresh();
       toastManager.add({
         type: "success",

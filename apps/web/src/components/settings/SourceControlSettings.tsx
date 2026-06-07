@@ -14,10 +14,7 @@ import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 
 import { useSettings, useUpdateSettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
-import {
-  refreshSourceControlDiscovery,
-  useSourceControlDiscovery,
-} from "../../lib/sourceControlDiscoveryState";
+import { useSourceControlDiscovery } from "../../lib/sourceControlDiscoveryState";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Collapsible, CollapsibleContent } from "../ui/collapsible";
@@ -444,7 +441,7 @@ export function SourceControlSettingsPanel() {
     result.versionControlSystems.length > 0 || result.sourceControlProviders.length > 0;
   const isInitialScanPending = discovery.isPending && discovery.data === null;
   const handleScan = () => {
-    void refreshSourceControlDiscovery();
+    discovery.refresh();
   };
   const scanButton = (
     <Tooltip>

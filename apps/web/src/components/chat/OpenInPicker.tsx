@@ -1,4 +1,4 @@
-import { EditorId, type ResolvedKeybindingsConfig } from "@t3tools/contracts";
+import { EditorId, type EnvironmentId, type ResolvedKeybindingsConfig } from "@t3tools/contracts";
 import { memo, useCallback, useEffect, useMemo } from "react";
 import { isOpenFavoriteEditorShortcut, shortcutLabelForCommand } from "../../keybindings";
 import { usePreferredEditor } from "../../editorPreferences";
@@ -32,7 +32,7 @@ import {
   WebStormIcon,
 } from "../JetBrainsIcons";
 import { isMacPlatform, isWindowsPlatform } from "~/lib/utils";
-import { readLocalApi } from "~/localApi";
+import { useWebActions } from "~/connection/useWebEnvironmentData";
 
 const resolveOptions = (platform: string, availableEditors: ReadonlyArray<EditorId>) => {
   const baseOptions: ReadonlyArray<{ label: string; Icon: Icon; value: EditorId }> = [
@@ -151,14 +151,17 @@ const resolveOptions = (platform: string, availableEditors: ReadonlyArray<Editor
 };
 
 export const OpenInPicker = memo(function OpenInPicker({
+  environmentId,
   keybindings,
   availableEditors,
   openInCwd,
 }: {
+  environmentId: EnvironmentId;
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
   openInCwd: string | null;
 }) {
+  const actions = useWebActions();
   const [preferredEditor, setPreferredEditor] = usePreferredEditor(availableEditors);
   const options = useMemo(
     () => resolveOptions(navigator.platform, availableEditors),
@@ -168,14 +171,19 @@ export const OpenInPicker = memo(function OpenInPicker({
 
   const openInEditor = useCallback(
     (editorId: EditorId | null) => {
-      const api = readLocalApi();
-      if (!api || !openInCwd) return;
+      if (!openInCwd) return;
       const editor = editorId ?? preferredEditor;
       if (!editor) return;
-      void api.shell.openInEditor(openInCwd, editor);
+      void actions.shell.openInEditor({
+        environmentId,
+        input: {
+          cwd: openInCwd,
+          editor,
+        },
+      });
       setPreferredEditor(editor);
     },
-    [preferredEditor, openInCwd, setPreferredEditor],
+    [actions.shell, environmentId, openInCwd, preferredEditor, setPreferredEditor],
   );
 
   const openFavoriteEditorShortcutLabel = useMemo(
@@ -185,17 +193,22 @@ export const OpenInPicker = memo(function OpenInPicker({
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent) => {
-      const api = readLocalApi();
       if (!isOpenFavoriteEditorShortcut(e, keybindings)) return;
-      if (!api || !openInCwd) return;
+      if (!openInCwd) return;
       if (!preferredEditor) return;
 
       e.preventDefault();
-      void api.shell.openInEditor(openInCwd, preferredEditor);
+      void actions.shell.openInEditor({
+        environmentId,
+        input: {
+          cwd: openInCwd,
+          editor: preferredEditor,
+        },
+      });
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [preferredEditor, keybindings, openInCwd]);
+  }, [actions.shell, environmentId, keybindings, openInCwd, preferredEditor]);
 
   return (
     <Group aria-label="Subscription actions">

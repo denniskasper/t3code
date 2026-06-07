@@ -5,11 +5,9 @@ import { useCallback, useRef } from "react";
 
 import { getFallbackThreadIdAfterDelete } from "../components/Sidebar.logic";
 import { useComposerDraftStore } from "../composerDraftStore";
+import { useWebActions } from "../connection/useWebEnvironmentData";
 import { useNewThreadHandler } from "./useHandleNewThread";
-import { ensureEnvironmentApi, readEnvironmentApi } from "../environmentApi";
-import { invalidateSourceControlState } from "../lib/sourceControlActions";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
-import { newCommandId } from "../lib/utils";
 import { readLocalApi } from "../localApi";
 import {
   selectProjectByRef,
@@ -24,6 +22,7 @@ import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { useSettings } from "./useSettings";
 
 export function useThreadActions() {
+  const actions = useWebActions();
   const sidebarThreadSortOrder = useSettings((settings) => settings.sidebarThreadSortOrder);
   const confirmThreadDelete = useSettings((settings) => settings.confirmThreadDelete);
   const clearComposerDraftForThread = useComposerDraftStore((store) => store.clearDraftThread);
@@ -58,8 +57,6 @@ export function useThreadActions() {
 
   const archiveThread = useCallback(
     async (target: ScopedThreadRef) => {
-      const api = readEnvironmentApi(target.environmentId);
-      if (!api) return;
       const resolved = resolveThreadTarget(target);
       if (!resolved) return;
       const { thread, threadRef } = resolved;
@@ -71,10 +68,9 @@ export function useThreadActions() {
       const shouldNavigateToDraft =
         currentRouteThreadRef?.threadId === threadRef.threadId &&
         currentRouteThreadRef.environmentId === threadRef.environmentId;
-      const archiveCommand = api.orchestration.dispatchCommand({
-        type: "thread.archive",
-        commandId: newCommandId(),
-        threadId: threadRef.threadId,
+      const archiveCommand = actions.threads.archive({
+        environmentId: threadRef.environmentId,
+        input: { threadId: threadRef.threadId },
       });
 
       if (shouldNavigateToDraft) {
@@ -84,31 +80,28 @@ export function useThreadActions() {
       await archiveCommand;
       refreshArchivedThreadsForEnvironment(threadRef.environmentId);
     },
-    [getCurrentRouteThreadRef, resolveThreadTarget],
+    [actions.threads, getCurrentRouteThreadRef, resolveThreadTarget],
   );
 
-  const unarchiveThread = useCallback(async (target: ScopedThreadRef) => {
-    const api = readEnvironmentApi(target.environmentId);
-    if (!api) return;
-    await api.orchestration.dispatchCommand({
-      type: "thread.unarchive",
-      commandId: newCommandId(),
-      threadId: target.threadId,
-    });
-    refreshArchivedThreadsForEnvironment(target.environmentId);
-  }, []);
+  const unarchiveThread = useCallback(
+    async (target: ScopedThreadRef) => {
+      await actions.threads.unarchive({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId },
+      });
+      refreshArchivedThreadsForEnvironment(target.environmentId);
+    },
+    [actions.threads],
+  );
 
   const deleteThread = useCallback(
     async (target: ScopedThreadRef, opts: { deletedThreadKeys?: ReadonlySet<string> } = {}) => {
-      const api = readEnvironmentApi(target.environmentId);
-      if (!api) return;
       const resolved = resolveThreadTarget(target);
       if (!resolved) {
         // Thread not in main store (e.g. archived thread) — dispatch delete directly.
-        await api.orchestration.dispatchCommand({
-          type: "thread.delete",
-          commandId: newCommandId(),
-          threadId: target.threadId,
+        await actions.threads.delete({
+          environmentId: target.environmentId,
+          input: { threadId: target.threadId },
         });
         refreshArchivedThreadsForEnvironment(target.environmentId);
         return;
@@ -155,18 +148,19 @@ export function useThreadActions() {
         ));
 
       if (thread.session && thread.session.status !== "closed") {
-        await api.orchestration
-          .dispatchCommand({
-            type: "thread.session.stop",
-            commandId: newCommandId(),
-            threadId: threadRef.threadId,
-            createdAt: new Date().toISOString(),
+        await actions.threads
+          .stopSession({
+            environmentId: threadRef.environmentId,
+            input: { threadId: threadRef.threadId },
           })
           .catch(() => undefined);
       }
 
       try {
-        await api.terminal.close({ threadId: threadRef.threadId, deleteHistory: true });
+        await actions.terminal.close({
+          environmentId: threadRef.environmentId,
+          input: { threadId: threadRef.threadId, deleteHistory: true },
+        });
       } catch {
         // Terminal may already be closed.
       }
@@ -182,10 +176,9 @@ export function useThreadActions() {
         deletedThreadIds,
         sortOrder: sidebarThreadSortOrder,
       });
-      await api.orchestration.dispatchCommand({
-        type: "thread.delete",
-        commandId: newCommandId(),
-        threadId: threadRef.threadId,
+      await actions.threads.delete({
+        environmentId: threadRef.environmentId,
+        input: { threadId: threadRef.threadId },
       });
       refreshArchivedThreadsForEnvironment(threadRef.environmentId);
       clearComposerDraftForThread(threadRef);
@@ -222,13 +215,17 @@ export function useThreadActions() {
       }
 
       try {
-        await ensureEnvironmentApi(threadRef.environmentId).vcs.removeWorktree({
-          cwd: threadProject.cwd,
-          path: orphanedWorktreePath,
-          force: true,
-        });
-        await invalidateSourceControlState({
+        await actions.vcs.removeWorktree({
           environmentId: threadRef.environmentId,
+          input: {
+            cwd: threadProject.cwd,
+            path: orphanedWorktreePath,
+            force: true,
+          },
+        });
+        await actions.vcs.refreshStatus({
+          environmentId: threadRef.environmentId,
+          input: { cwd: threadProject.cwd },
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error removing worktree.";
@@ -248,6 +245,9 @@ export function useThreadActions() {
       }
     },
     [
+      actions.terminal,
+      actions.threads,
+      actions.vcs,
       clearComposerDraftForThread,
       clearProjectDraftThreadById,
       clearTerminalUiState,
@@ -260,8 +260,6 @@ export function useThreadActions() {
 
   const confirmAndDeleteThread = useCallback(
     async (target: ScopedThreadRef) => {
-      const api = readEnvironmentApi(target.environmentId);
-      if (!api) return;
       const localApi = readLocalApi();
       const resolved = resolveThreadTarget(target);
 

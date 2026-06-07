@@ -46,6 +46,8 @@ import {
   sortProviderInstanceEntries,
 } from "../../providerInstances";
 import { ensureLocalApi, readLocalApi } from "../../localApi";
+import { useWebActions } from "../../connection/useWebEnvironmentData";
+import { useWebPrimaryEnvironment } from "../../connection/useWebEnvironments";
 import { useShallow } from "zustand/react/shallow";
 import { selectProjectsAcrossEnvironments, useStore } from "../../store";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
@@ -920,6 +922,8 @@ export function ProviderSettingsPanel() {
   const settings = useSettings();
   const { updateSettings } = useUpdateSettings();
   const serverProviders = useServerProviders();
+  const primaryEnvironment = useWebPrimaryEnvironment();
+  const actions = useWebActions();
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [isAddInstanceDialogOpen, setIsAddInstanceDialogOpen] = useState(false);
   const [updatingProviderDrivers, setUpdatingProviderDrivers] = useState<
@@ -958,8 +962,16 @@ export function ProviderSettingsPanel() {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
     setIsRefreshingProviders(true);
-    void ensureLocalApi()
-      .server.refreshProviders()
+    if (!primaryEnvironment) {
+      refreshingRef.current = false;
+      setIsRefreshingProviders(false);
+      return;
+    }
+    void actions.server
+      .refreshProviders({
+        environmentId: primaryEnvironment.environmentId,
+        input: {},
+      })
       .catch((error: unknown) => {
         console.warn("Failed to refresh providers", error);
       })
@@ -967,50 +979,57 @@ export function ProviderSettingsPanel() {
         refreshingRef.current = false;
         setIsRefreshingProviders(false);
       });
-  }, []);
+  }, [actions.server, primaryEnvironment]);
 
-  const runProviderUpdate = useCallback(async (candidate: ProviderUpdateCandidate) => {
-    let started = false;
-    setUpdatingProviderDrivers((previous) => {
-      if (previous.has(candidate.driver)) {
-        return previous;
-      }
-      started = true;
-      const next = new Set(previous);
-      next.add(candidate.driver);
-      return next;
-    });
-    if (!started) {
-      return;
-    }
-
-    try {
-      await ensureLocalApi().server.updateProvider({
-        provider: candidate.driver,
-        instanceId: candidate.instanceId,
-      });
-    } catch (error) {
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: `Could not update ${PROVIDER_DISPLAY_NAMES[candidate.driver] ?? candidate.driver}`,
-          description:
-            error instanceof Error
-              ? error.message
-              : "The provider update command could not be started.",
-        }),
-      );
-    } finally {
+  const runProviderUpdate = useCallback(
+    async (candidate: ProviderUpdateCandidate) => {
+      if (!primaryEnvironment) return;
+      let started = false;
       setUpdatingProviderDrivers((previous) => {
-        if (!previous.has(candidate.driver)) {
+        if (previous.has(candidate.driver)) {
           return previous;
         }
+        started = true;
         const next = new Set(previous);
-        next.delete(candidate.driver);
+        next.add(candidate.driver);
         return next;
       });
-    }
-  }, []);
+      if (!started) {
+        return;
+      }
+
+      try {
+        await actions.server.updateProvider({
+          environmentId: primaryEnvironment.environmentId,
+          input: {
+            provider: candidate.driver,
+            instanceId: candidate.instanceId,
+          },
+        });
+      } catch (error) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: `Could not update ${PROVIDER_DISPLAY_NAMES[candidate.driver] ?? candidate.driver}`,
+            description:
+              error instanceof Error
+                ? error.message
+                : "The provider update command could not be started.",
+          }),
+        );
+      } finally {
+        setUpdatingProviderDrivers((previous) => {
+          if (!previous.has(candidate.driver)) {
+            return previous;
+          }
+          const next = new Set(previous);
+          next.delete(candidate.driver);
+          return next;
+        });
+      }
+    },
+    [actions.server, primaryEnvironment],
+  );
 
   interface InstanceRow {
     readonly instanceId: ProviderInstanceId;

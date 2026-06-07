@@ -1,6 +1,7 @@
-import { EDITORS, EditorId, LocalApi } from "@t3tools/contracts";
+import { EDITORS, EditorId, type EnvironmentId } from "@t3tools/contracts";
 import { getLocalStorageItem, setLocalStorageItem, useLocalStorage } from "./hooks/useLocalStorage";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
+import { useWebActions } from "./connection/useWebEnvironmentData";
 
 const LAST_EDITOR_KEY = "t3code:last-editor";
 
@@ -26,10 +27,30 @@ export function resolveAndPersistPreferredEditor(
   return editor ?? null;
 }
 
-export async function openInPreferredEditor(api: LocalApi, targetPath: string): Promise<EditorId> {
-  const { availableEditors } = await api.server.getConfig();
-  const editor = resolveAndPersistPreferredEditor(availableEditors);
-  if (!editor) throw new Error("No available editors found.");
-  await api.shell.openInEditor(targetPath, editor);
-  return editor;
+export function useOpenInPreferredEditor(
+  environmentId: EnvironmentId | null,
+  availableEditors: readonly EditorId[],
+) {
+  const actions = useWebActions();
+
+  return useCallback(
+    async (targetPath: string): Promise<EditorId> => {
+      if (environmentId === null) {
+        throw new Error("No environment is selected.");
+      }
+      const editor = resolveAndPersistPreferredEditor(availableEditors);
+      if (!editor) {
+        throw new Error("No available editors found.");
+      }
+      await actions.shell.openInEditor({
+        environmentId,
+        input: {
+          cwd: targetPath,
+          editor,
+        },
+      });
+      return editor;
+    },
+    [actions.shell, availableEditors, environmentId],
+  );
 }

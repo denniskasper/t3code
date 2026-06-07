@@ -3,8 +3,6 @@ import { Plus, SquareSplitHorizontal, TerminalSquare, Trash2, XIcon } from "luci
 import {
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
-  type TerminalAttachStreamEvent,
-  type TerminalSessionSnapshot,
   type ThreadId,
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
@@ -21,7 +19,7 @@ import {
 } from "react";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
-import { openInPreferredEditor } from "../editorPreferences";
+import { useOpenInPreferredEditor } from "../editorPreferences";
 import {
   collectWrappedTerminalLinkLine,
   extractTerminalLinks,
@@ -45,9 +43,9 @@ import {
   MAX_TERMINALS_PER_GROUP,
   type ThreadTerminalGroup,
 } from "../types";
-import { readEnvironmentApi } from "~/environmentApi";
 import { readLocalApi } from "~/localApi";
-import { attachTerminalSession } from "../terminalSessionState";
+import { useWebTerminalController } from "../connection/webTerminalSessions";
+import { useWebServerConfig } from "../connection/useWebEnvironmentData";
 
 const MIN_DRAWER_HEIGHT = 180;
 const MAX_DRAWER_HEIGHT_RATIO = 0.75;
@@ -68,10 +66,10 @@ function writeSystemMessage(terminal: Terminal, message: string): void {
   terminal.write(`\r\n[terminal] ${message}\r\n`);
 }
 
-function writeTerminalSnapshot(terminal: Terminal, snapshot: TerminalSessionSnapshot): void {
+function writeTerminalBuffer(terminal: Terminal, buffer: string): void {
   terminal.write("\u001bc");
-  if (snapshot.history.length > 0) {
-    terminal.write(snapshot.history);
+  if (buffer.length > 0) {
+    terminal.write(buffer);
   }
 }
 
@@ -294,6 +292,12 @@ export function TerminalViewport({
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const environmentId = threadRef.environmentId;
+  const serverConfig = useWebServerConfig(environmentId);
+  const openInPreferredEditor = useOpenInPreferredEditor(
+    environmentId,
+    serverConfig.data?.availableEditors ?? [],
+  );
+  const openTerminalPath = useEffectEvent((target: string) => openInPreferredEditor(target));
   const hasHandledExitRef = useRef(false);
   const selectionPointerRef = useRef<{ x: number; y: number } | null>(null);
   const selectionGestureActiveRef = useRef(false);
@@ -309,6 +313,20 @@ export function TerminalViewport({
     onAddTerminalContext(selection);
   });
   const readTerminalLabel = useEffectEvent(() => terminalLabel);
+  const terminalController = useWebTerminalController({
+    environmentId,
+    terminal: {
+      threadId,
+      terminalId,
+      cwd,
+      ...(worktreePath !== undefined ? { worktreePath } : {}),
+      ...(runtimeEnv ? { env: runtimeEnv } : {}),
+    },
+  });
+  const writeTerminal = useEffectEvent(terminalController.write);
+  const resizeTerminal = useEffectEvent(terminalController.resize);
+  const readTerminalSession = useEffectEvent(() => terminalController.session);
+  const previousSessionRef = useRef(terminalController.session);
 
   useEffect(() => {
     keybindingsRef.current = keybindings;
@@ -318,10 +336,7 @@ export function TerminalViewport({
     const mount = containerRef.current;
     if (!mount) return;
 
-    let disposed = false;
-    const api = readEnvironmentApi(environmentId);
     const localApi = readLocalApi();
-    if (!api) return;
 
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
@@ -338,6 +353,13 @@ export function TerminalViewport({
 
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
+    previousSessionRef.current = {
+      ...readTerminalSession(),
+      buffer: "",
+      status: "closed",
+      error: null,
+      version: 0,
+    };
 
     const clearSelectionAction = () => {
       selectionActionRequestIdRef.current += 1;
@@ -422,7 +444,7 @@ export function TerminalViewport({
       const activeTerminal = terminalRef.current;
       if (!activeTerminal) return;
       try {
-        await api.terminal.write({ threadId, terminalId, data });
+        await writeTerminal(data);
       } catch (error) {
         writeSystemMessage(activeTerminal, error instanceof Error ? error.message : fallbackError);
       }
@@ -502,12 +524,15 @@ export function TerminalViewport({
 
               const latestTerminal = terminalRef.current;
               if (!latestTerminal) return;
-              if (!localApi) {
-                writeSystemMessage(latestTerminal, "Opening links is unavailable in this browser.");
-                return;
-              }
 
               if (match.kind === "url") {
+                if (!localApi) {
+                  writeSystemMessage(
+                    latestTerminal,
+                    "Opening links is unavailable in this browser.",
+                  );
+                  return;
+                }
                 void localApi.shell.openExternal(match.text).catch((error: unknown) => {
                   writeSystemMessage(
                     latestTerminal,
@@ -518,7 +543,7 @@ export function TerminalViewport({
               }
 
               const target = resolvePathLinkTarget(match.text, cwd);
-              void openInPreferredEditor(localApi, target).catch((error) => {
+              void openTerminalPath(target).catch((error) => {
                 writeSystemMessage(
                   latestTerminal,
                   error instanceof Error ? error.message : "Unable to open path",
@@ -531,14 +556,9 @@ export function TerminalViewport({
     });
 
     const inputDisposable = terminal.onData((data) => {
-      void api.terminal
-        .write({ threadId, terminalId, data })
-        .catch((err) =>
-          writeSystemMessage(
-            terminal,
-            err instanceof Error ? err.message : "Terminal write failed",
-          ),
-        );
+      void writeTerminal(data).catch((err) =>
+        writeSystemMessage(terminal, err instanceof Error ? err.message : "Terminal write failed"),
+      );
     });
 
     const selectionDisposable = terminal.onSelectionChange(() => {
@@ -584,107 +604,6 @@ export function TerminalViewport({
       attributeFilter: ["class", "style"],
     });
 
-    const applyAttachEvent = (event: TerminalAttachStreamEvent) => {
-      const activeTerminal = terminalRef.current;
-      if (!activeTerminal) {
-        return;
-      }
-
-      if (event.type === "activity") {
-        return;
-      }
-
-      if (event.type === "snapshot") {
-        hasHandledExitRef.current = false;
-        clearSelectionAction();
-        writeTerminalSnapshot(activeTerminal, event.snapshot);
-        return;
-      }
-
-      if (event.type === "output") {
-        activeTerminal.write(event.data);
-        clearSelectionAction();
-        return;
-      }
-
-      if (event.type === "restarted") {
-        hasHandledExitRef.current = false;
-        clearSelectionAction();
-        writeTerminalSnapshot(activeTerminal, event.snapshot);
-        return;
-      }
-
-      if (event.type === "cleared") {
-        clearSelectionAction();
-        activeTerminal.clear();
-        activeTerminal.write("\u001bc");
-        return;
-      }
-
-      if (event.type === "error") {
-        writeSystemMessage(activeTerminal, event.message);
-        return;
-      }
-
-      if (event.type === "closed") {
-        writeSystemMessage(activeTerminal, "Terminal closed");
-      } else {
-        const details = [
-          typeof event.exitCode === "number" ? `code ${event.exitCode}` : null,
-          typeof event.exitSignal === "number" ? `signal ${event.exitSignal}` : null,
-        ]
-          .filter((value): value is string => value !== null)
-          .join(", ");
-        writeSystemMessage(
-          activeTerminal,
-          details.length > 0 ? `Process exited (${details})` : "Process exited",
-        );
-      }
-
-      if (hasHandledExitRef.current) {
-        return;
-      }
-      hasHandledExitRef.current = true;
-      window.setTimeout(() => {
-        if (!hasHandledExitRef.current) {
-          return;
-        }
-        handleSessionExited();
-      }, 0);
-    };
-    let unsubscribeAttach: (() => void) | null = null;
-    const attachTerminal = () => {
-      const activeTerminal = terminalRef.current;
-      const activeFitAddon = fitAddonRef.current;
-      if (!activeTerminal || !activeFitAddon) return;
-      fitTerminalSafely(activeFitAddon);
-      unsubscribeAttach = attachTerminalSession({
-        environmentId,
-        client: api,
-        terminal: {
-          threadId,
-          terminalId,
-          cwd,
-          ...(worktreePath !== undefined ? { worktreePath } : {}),
-          cols: activeTerminal.cols,
-          rows: activeTerminal.rows,
-          ...(runtimeEnv ? { env: runtimeEnv } : {}),
-        },
-        onEvent: (event) => {
-          if (disposed) return;
-          applyAttachEvent(event);
-        },
-        onSnapshot: () => {
-          if (disposed) return;
-          if (autoFocus) {
-            window.requestAnimationFrame(() => {
-              activeTerminal.focus();
-            });
-          }
-        },
-      });
-    };
-
     const fitTimer = window.setTimeout(() => {
       const activeTerminal = terminalRef.current;
       const activeFitAddon = fitAddonRef.current;
@@ -695,21 +614,10 @@ export function TerminalViewport({
       if (wasAtBottom) {
         activeTerminal.scrollToBottom();
       }
-      void api.terminal
-        .resize({
-          threadId,
-          terminalId,
-          cols: activeTerminal.cols,
-          rows: activeTerminal.rows,
-        })
-        .catch(() => undefined);
+      void resizeTerminal(activeTerminal.cols, activeTerminal.rows).catch(() => undefined);
     }, 30);
-    attachTerminal();
 
     return () => {
-      disposed = true;
-      unsubscribeAttach?.();
-      unsubscribeAttach = null;
       window.clearTimeout(fitTimer);
       inputDisposable.dispose();
       selectionDisposable.dispose();
@@ -730,6 +638,66 @@ export function TerminalViewport({
   }, [cwd, environmentId, runtimeEnvKey, terminalId, threadId, worktreePath]);
 
   useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      previousSessionRef.current = terminalController.session;
+      return;
+    }
+
+    const previous = previousSessionRef.current;
+    const current = terminalController.session;
+    if (current.version === previous.version) {
+      return;
+    }
+
+    if (
+      current.buffer.length >= previous.buffer.length &&
+      current.buffer.startsWith(previous.buffer)
+    ) {
+      terminal.write(current.buffer.slice(previous.buffer.length));
+    } else {
+      writeTerminalBuffer(terminal, current.buffer);
+    }
+    terminal.clearSelection();
+
+    if (current.error !== null && current.error !== previous.error) {
+      writeSystemMessage(terminal, current.error);
+    }
+
+    if (current.status === "running") {
+      hasHandledExitRef.current = false;
+    } else if (
+      (current.status === "closed" || current.status === "exited") &&
+      current.status !== previous.status &&
+      !hasHandledExitRef.current
+    ) {
+      hasHandledExitRef.current = true;
+      writeSystemMessage(
+        terminal,
+        current.status === "closed" ? "Terminal closed" : "Process exited",
+      );
+      window.setTimeout(() => {
+        if (hasHandledExitRef.current) {
+          handleSessionExited();
+        }
+      }, 0);
+    }
+
+    if (previous.version === 0 && autoFocus) {
+      window.requestAnimationFrame(() => {
+        terminal.focus();
+      });
+    }
+    previousSessionRef.current = current;
+  }, [
+    autoFocus,
+    terminalController.session.buffer,
+    terminalController.session.error,
+    terminalController.session.status,
+    terminalController.session.version,
+  ]);
+
+  useEffect(() => {
     if (!autoFocus) return;
     const terminal = terminalRef.current;
     if (!terminal) return;
@@ -742,24 +710,16 @@ export function TerminalViewport({
   }, [autoFocus, focusRequestId]);
 
   useEffect(() => {
-    const api = readEnvironmentApi(environmentId);
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!api || !terminal || !fitAddon) return;
+    if (!terminal || !fitAddon) return;
     const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
     const frame = window.requestAnimationFrame(() => {
       fitTerminalSafely(fitAddon);
       if (wasAtBottom) {
         terminal.scrollToBottom();
       }
-      void api.terminal
-        .resize({
-          threadId,
-          terminalId,
-          cols: terminal.cols,
-          rows: terminal.rows,
-        })
-        .catch(() => undefined);
+      void resizeTerminal(terminal.cols, terminal.rows).catch(() => undefined);
     });
     return () => {
       window.cancelAnimationFrame(frame);

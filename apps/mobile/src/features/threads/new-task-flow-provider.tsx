@@ -22,7 +22,7 @@ import {
   setComposerDraftText,
   useComposerDraft,
 } from "../../state/use-composer-drafts";
-import { vcsRefManager, useVcsRefs } from "../../state/use-vcs-refs";
+import { useVcsRefs } from "../../state/use-vcs-refs";
 import { useRemoteCatalog } from "../../state/use-remote-catalog";
 import {
   setPendingConnectionError,
@@ -392,37 +392,28 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
 
     const loadVersion = ++branchLoadVersionRef.current;
     const projectKey = scopedProjectKey(selectedProject.environmentId, selectedProject.id);
-    try {
-      const result = await vcsRefManager.load({
-        environmentId: selectedProject.environmentId,
-        cwd: selectedProject.workspaceRoot,
-        query: null,
-      });
-      if (loadVersion !== branchLoadVersionRef.current || selectedProjectKey !== projectKey) {
-        return;
-      }
-      setPendingConnectionError(null);
-      const branches = pipe(
-        result?.refs ?? [],
-        Arr.filter((branch) => !branch.isRemote),
-      );
-
-      if (workspaceMode === "worktree" && !selectedBranchName) {
-        const preferredBranch =
-          branches.find((branch) => branch.current)?.name ??
-          branches.find((branch) => branch.isDefault)?.name ??
-          null;
-        if (preferredBranch) {
-          setSelectedBranchName(preferredBranch);
-        }
-      }
-    } catch {
-      if (loadVersion !== branchLoadVersionRef.current) {
-        return;
-      }
-      setPendingConnectionError("Failed to load branches.");
+    branchState.refresh();
+    if (loadVersion !== branchLoadVersionRef.current || selectedProjectKey !== projectKey) {
+      return;
     }
-  }, [selectedBranchName, selectedProject, selectedProjectKey, workspaceMode]);
+    setPendingConnectionError(null);
+    if (workspaceMode === "worktree" && !selectedBranchName) {
+      const preferredBranch =
+        availableBranches.find((branch) => branch.current)?.name ??
+        availableBranches.find((branch) => branch.isDefault)?.name ??
+        null;
+      if (preferredBranch) {
+        setSelectedBranchName(preferredBranch);
+      }
+    }
+  }, [
+    availableBranches,
+    branchState,
+    selectedBranchName,
+    selectedProject,
+    selectedProjectKey,
+    workspaceMode,
+  ]);
 
   const value = useMemo<NewTaskFlowContextValue>(
     () => ({

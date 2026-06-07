@@ -173,9 +173,7 @@ export function PullRequestThreadDialog({
   const errorMessage =
     validationMessage ??
     (resolvedPullRequest === null && pullRequestResolution.error
-      ? pullRequestResolution.error instanceof Error
-        ? pullRequestResolution.error.message
-        : `Failed to resolve ${terminology.singular}.`
+      ? pullRequestResolution.error
       : preparePullRequestThreadAction.error instanceof Error
         ? preparePullRequestThreadAction.error.message
         : preparePullRequestThreadAction.error

@@ -239,7 +239,7 @@ describe("createManagedRelayQueryManager", () => {
     });
   });
 
-  it("reports token and relay request timings for environment status queries", async () => {
+  it("reports token and relay request phases for environment status queries", async () => {
     const onQueryEvent = vi.fn();
     const manager = createManager(undefined, onQueryEvent);
     setSession();
@@ -264,7 +264,6 @@ describe("createManagedRelayQueryManager", () => {
         phase: "success",
         accountId: "account-1",
         environmentId: environment.environmentId,
-        durationMs: expect.any(Number),
       }),
     );
   });

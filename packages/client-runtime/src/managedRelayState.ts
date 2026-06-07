@@ -39,7 +39,6 @@ export interface ManagedRelayQueryEvent {
   readonly phase: "start" | "success" | "failure";
   readonly accountId: string;
   readonly environmentId?: string;
-  readonly durationMs?: number;
   readonly message?: string;
   readonly traceId?: string | null;
 }
@@ -101,19 +100,17 @@ export function createManagedRelaySession(input: {
 
   return {
     accountId: input.accountId,
-    readClerkToken: () =>
-      Clock.currentTimeMillis.pipe(
-        Effect.flatMap((nowMillis) =>
-          Effect.tryPromise({
-            try: () => readCachedClerkToken(nowMillis),
-            catch: (cause) =>
-              new ManagedRelaySessionError({
-                message: "Could not obtain the T3 Cloud session token.",
-                cause,
-              }),
+    readClerkToken: Effect.fn("clientRuntime.managedRelaySession.readClerkToken")(function* () {
+      const nowMillis = yield* Clock.currentTimeMillis;
+      return yield* Effect.tryPromise({
+        try: () => readCachedClerkToken(nowMillis),
+        catch: (cause) =>
+          new ManagedRelaySessionError({
+            message: "Could not obtain the T3 Cloud session token.",
+            cause,
           }),
-        ),
-      ),
+      });
+    }),
   };
 }
 
@@ -140,10 +137,10 @@ function readSessionClerkToken(
   );
 }
 
-export function waitForManagedRelayClerkToken(
-  registry: AtomRegistry.AtomRegistry,
-): Effect.Effect<string, ManagedRelaySessionError> {
-  return Effect.callback<string, ManagedRelaySessionError>((resume) => {
+export const waitForManagedRelayClerkToken = Effect.fn(
+  "clientRuntime.managedRelaySession.waitForClerkToken",
+)(function* (registry: AtomRegistry.AtomRegistry) {
+  return yield* Effect.callback<string, ManagedRelaySessionError>((resume) => {
     let unsubscribe: (() => void) | undefined;
     let completed = false;
     const readCurrentSession = () => {
@@ -168,7 +165,7 @@ export function waitForManagedRelayClerkToken(
     readCurrentSession();
     return Effect.sync(() => unsubscribe?.());
   });
-}
+});
 
 function requireClerkToken(
   get: Atom.AtomContext,
@@ -270,31 +267,26 @@ export function createManagedRelayQueryManager(
   const staleTime = options?.staleTimeMs ?? DEFAULT_STALE_TIME_MS;
   const idleTtl = options?.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
   const observe = <A, E, R>(
-    input: Omit<ManagedRelayQueryEvent, "phase" | "durationMs" | "message" | "traceId">,
+    input: Omit<ManagedRelayQueryEvent, "phase" | "message" | "traceId">,
     effect: Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E, R> =>
     Effect.gen(function* () {
-      const startedAt = yield* Clock.currentTimeMillis;
       options?.onQueryEvent?.({ ...input, phase: "start" });
       return yield* effect.pipe(
         Effect.onExit((exit) =>
-          Clock.currentTimeMillis.pipe(
-            Effect.map((finishedAt) => {
-              const durationMs = finishedAt - startedAt;
-              if (exit._tag === "Success") {
-                options?.onQueryEvent?.({ ...input, phase: "success", durationMs });
-                return;
-              }
-              const error = Cause.squash(exit.cause);
-              options?.onQueryEvent?.({
-                ...input,
-                phase: "failure",
-                durationMs,
-                message: error instanceof Error ? error.message : String(error),
-                traceId: findErrorTraceId(error),
-              });
-            }),
-          ),
+          Effect.sync(() => {
+            if (exit._tag === "Success") {
+              options?.onQueryEvent?.({ ...input, phase: "success" });
+              return;
+            }
+            const error = Cause.squash(exit.cause);
+            options?.onQueryEvent?.({
+              ...input,
+              phase: "failure",
+              message: error instanceof Error ? error.message : String(error),
+              traceId: findErrorTraceId(error),
+            });
+          }),
         ),
       );
     });

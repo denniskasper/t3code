@@ -2,7 +2,7 @@ import type { AuthSessionState } from "@t3tools/contracts";
 import React, { startTransition, useEffect, useRef, useState, useCallback } from "react";
 
 import { APP_DISPLAY_NAME } from "../../branding";
-import { addSavedEnvironment } from "../../environments/runtime";
+import { useWebEnvironmentActions } from "../../connection/useWebEnvironments";
 import {
   peekPairingTokenFromUrl,
   stripPairingTokenFromUrl,
@@ -162,6 +162,7 @@ export function PairingRouteSurface({
 }
 
 export function HostedPairingRouteSurface() {
+  const { connectPairing } = useWebEnvironmentActions();
   const hostedPairingRequestRef = useRef(readHostedPairingRequest());
   const [status, setStatus] = useState<"pairing" | "paired" | "error">(() =>
     hostedPairingRequestRef.current ? "pairing" : "error",
@@ -198,13 +199,12 @@ export function HostedPairingRouteSurface() {
     tokenSubmittedRef.current = true;
 
     try {
-      const record = await addSavedEnvironment({
-        label: request.label,
+      await connectPairing({
         host: request.host,
         pairingCode: request.token,
       });
       setStatus("paired");
-      setMessage(`${record.label} is saved in this browser.`);
+      setMessage(`${request.label || "The environment"} is saved in this browser.`);
     } catch (error) {
       tokenSubmittedRef.current = false;
       setStatus("error");
@@ -213,7 +213,7 @@ export function HostedPairingRouteSurface() {
         `${errorMessageFromUnknown(error)} If the backend accepted this one-time token, request a new pairing link before retrying.`,
       );
     }
-  }, []);
+  }, [connectPairing]);
 
   useEffect(() => {
     if (submitAttemptedRef.current) {

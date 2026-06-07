@@ -1,32 +1,46 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import {
   EnvironmentScopedProjectShell,
   EnvironmentScopedThreadShell,
-  type VcsRef,
   type GitActionRequestInput,
+  type VcsActionOperation,
+  type VcsRef,
 } from "@t3tools/client-runtime";
-import { CommandId, type GitRunStackedActionResult } from "@t3tools/contracts";
+import type { GitRunStackedActionResult } from "@t3tools/contracts";
 import {
   dedupeRemoteBranchesWithLocalMatches,
   sanitizeFeatureBranchName,
 } from "@t3tools/shared/git";
 
+import { useMobileActions } from "../connection/useMobileEnvironmentData";
 import { uuidv4 } from "../lib/uuid";
-import { getEnvironmentClient } from "./environment-session-registry";
 import { setPendingConnectionError } from "./use-remote-environment-registry";
-import { vcsActionManager, showGitActionResult } from "./use-vcs-action-state";
-import { vcsRefManager } from "./use-vcs-refs";
-import { vcsStatusManager } from "./use-vcs-status";
+import {
+  beginVcsAction,
+  completeVcsAction,
+  failVcsAction,
+  showGitActionResult,
+} from "./use-vcs-action-state";
+import { useVcsRefs } from "./use-vcs-refs";
 import { useThreadSelection } from "./use-thread-selection";
 import { useSelectedThreadWorktree } from "./use-selected-thread-worktree";
 
 export function useSelectedThreadGitActions() {
+  const actions = useMobileActions();
   const { selectedThread, selectedThreadProject } = useThreadSelection();
   const { selectedThreadCwd, selectedThreadWorktreePath } = useSelectedThreadWorktree();
 
   const selectedThreadGitRootCwd = selectedThreadProject?.workspaceRoot ?? null;
-
+  const branchTarget = useMemo(
+    () => ({
+      environmentId: selectedThread?.environmentId ?? null,
+      cwd: selectedThreadGitRootCwd,
+      query: null,
+    }),
+    [selectedThread?.environmentId, selectedThreadGitRootCwd],
+  );
+  const branchState = useVcsRefs(branchTarget);
   const updateThreadGitContext = useCallback(
     async (
       thread: NonNullable<typeof selectedThread>,
@@ -35,20 +49,16 @@ export function useSelectedThreadGitActions() {
         readonly worktreePath?: string | null;
       },
     ) => {
-      const client = getEnvironmentClient(thread.environmentId);
-      if (!client) {
-        return;
-      }
-
-      await client.orchestration.dispatchCommand({
-        type: "thread.meta.update",
-        commandId: CommandId.make(uuidv4()),
-        threadId: thread.id,
-        ...(nextState.branch !== undefined ? { branch: nextState.branch } : {}),
-        ...(nextState.worktreePath !== undefined ? { worktreePath: nextState.worktreePath } : {}),
+      await actions.threads.updateMetadata({
+        environmentId: thread.environmentId,
+        input: {
+          threadId: thread.id,
+          ...(nextState.branch !== undefined ? { branch: nextState.branch } : {}),
+          ...(nextState.worktreePath !== undefined ? { worktreePath: nextState.worktreePath } : {}),
+        },
       });
     },
-    [],
+    [actions.threads],
   );
 
   const refreshSelectedThreadGitStatus = useCallback(
@@ -62,61 +72,72 @@ export function useSelectedThreadGitActions() {
         return null;
       }
 
+      const target = { environmentId: selectedThread.environmentId, cwd };
+      if (!options?.quiet) {
+        beginVcsAction(target, {
+          operation: "refresh_status",
+          label: "Refreshing source control status",
+        });
+      }
       try {
-        const client = getEnvironmentClient(selectedThread.environmentId);
-        if (!client) {
-          return null;
+        const result = await actions.vcs.refreshStatus({
+          environmentId: selectedThread.environmentId,
+          input: { cwd },
+        });
+        if (!options?.quiet) {
+          completeVcsAction(target);
         }
-
-        const status = await vcsActionManager.refreshStatus(
-          { environmentId: selectedThread.environmentId, cwd },
-          { ...client.vcs, runChangeRequest: client.git.runStackedAction },
-          options,
-        );
         setPendingConnectionError(null);
-        return status;
+        return result;
       } catch (error) {
+        if (!options?.quiet) {
+          failVcsAction(target, "refresh_status", error);
+        }
         const message = error instanceof Error ? error.message : "Failed to refresh git status.";
         setPendingConnectionError(message);
         return null;
       }
     },
-    [selectedThread, selectedThreadCwd, selectedThreadProject],
+    [actions.vcs, selectedThread, selectedThreadCwd, selectedThreadProject],
   );
 
   useEffect(() => {
     if (!selectedThread || !selectedThreadProject) {
       return;
     }
-
     void refreshSelectedThreadGitStatus({ quiet: true });
   }, [refreshSelectedThreadGitStatus, selectedThread, selectedThreadProject]);
 
   const runSelectedThreadGitMutation = useCallback(
     async <T>(
-      operation: (input: {
+      operation: VcsActionOperation,
+      label: string,
+      execute: (input: {
         readonly thread: EnvironmentScopedThreadShell;
         readonly project: EnvironmentScopedProjectShell;
         readonly cwd: string;
       }) => Promise<T>,
     ): Promise<T | null> => {
-      if (!selectedThread || !selectedThreadProject) {
+      if (!selectedThread || !selectedThreadProject || !selectedThreadCwd) {
         return null;
       }
 
-      const cwd = selectedThreadCwd;
-      if (!cwd) {
-        return null;
-      }
-
+      const target = {
+        environmentId: selectedThread.environmentId,
+        cwd: selectedThreadCwd,
+      };
+      beginVcsAction(target, { operation, label });
       try {
         setPendingConnectionError(null);
-        return await operation({
+        const result = await execute({
           thread: selectedThread,
           project: selectedThreadProject,
-          cwd,
+          cwd: selectedThreadCwd,
         });
+        completeVcsAction(target);
+        return result;
       } catch (error) {
+        failVcsAction(target, operation, error);
         const message = error instanceof Error ? error.message : "Git action failed.";
         setPendingConnectionError(message);
         showGitActionResult({ type: "error", title: "Git action failed", description: message });
@@ -127,37 +148,16 @@ export function useSelectedThreadGitActions() {
   );
 
   const refreshSelectedThreadBranches = useCallback(async (): Promise<ReadonlyArray<VcsRef>> => {
-    if (!selectedThread || !selectedThreadProject || !selectedThreadGitRootCwd) {
-      return [];
-    }
-
-    const client = getEnvironmentClient(selectedThread.environmentId);
-    if (!client) {
-      return [];
-    }
-
-    try {
-      const result = await vcsRefManager.load(
-        { environmentId: selectedThread.environmentId, cwd: selectedThreadGitRootCwd, query: null },
-        client.vcs,
-        { limit: 100 },
-      );
-      return dedupeRemoteBranchesWithLocalMatches(result?.refs ?? []).filter(
-        (branch) => !branch.isRemote,
-      );
-    } catch (error) {
-      setPendingConnectionError(
-        error instanceof Error ? error.message : "Failed to load branches.",
-      );
-      return [];
-    }
-  }, [selectedThread, selectedThreadGitRootCwd, selectedThreadProject]);
+    branchState.refresh();
+    return dedupeRemoteBranchesWithLocalMatches(branchState.data?.refs ?? []).filter(
+      (branch) => !branch.isRemote,
+    );
+  }, [branchState]);
 
   const syncSelectedThreadBranchState = useCallback(
     async (input: {
       readonly thread: EnvironmentScopedThreadShell;
       readonly cwd: string;
-      readonly branchRootCwd?: string | null;
       readonly nextThreadState?: {
         readonly branch?: string | null;
         readonly worktreePath?: string | null;
@@ -166,104 +166,109 @@ export function useSelectedThreadGitActions() {
       if (input.nextThreadState) {
         await updateThreadGitContext(input.thread, input.nextThreadState);
       }
-
-      const branchRootCwd = input.branchRootCwd ?? selectedThreadProject?.workspaceRoot ?? null;
-      if (branchRootCwd) {
-        vcsRefManager.invalidate({
-          environmentId: input.thread.environmentId,
-          cwd: branchRootCwd,
-          query: null,
-        });
-        await refreshSelectedThreadBranches();
-      }
-
+      branchState.refresh();
       await refreshSelectedThreadGitStatus({ quiet: true, cwd: input.cwd });
     },
-    [
-      refreshSelectedThreadBranches,
-      refreshSelectedThreadGitStatus,
-      selectedThreadProject?.workspaceRoot,
-      updateThreadGitContext,
-    ],
+    [branchState, refreshSelectedThreadGitStatus, updateThreadGitContext],
   );
 
   const onCheckoutSelectedThreadBranch = useCallback(
     async (branch: string) => {
-      await runSelectedThreadGitMutation(async ({ thread, cwd }) => {
-        const result = await vcsActionManager.switchRef(
-          { environmentId: thread.environmentId, cwd },
-          { refName: branch },
-        );
-        await syncSelectedThreadBranchState({
-          thread,
-          cwd,
-          nextThreadState: {
-            branch: result?.refName ?? thread.branch,
-            worktreePath: selectedThreadWorktreePath,
-          },
-        });
-      });
+      await runSelectedThreadGitMutation(
+        "switch_ref",
+        "Switching branch",
+        async ({ thread, cwd }) => {
+          const result = await actions.vcs.switchRef({
+            environmentId: thread.environmentId,
+            input: { cwd, refName: branch },
+          });
+          await syncSelectedThreadBranchState({
+            thread,
+            cwd,
+            nextThreadState: {
+              branch: result.refName ?? thread.branch,
+              worktreePath: selectedThreadWorktreePath,
+            },
+          });
+        },
+      );
     },
-    [runSelectedThreadGitMutation, selectedThreadWorktreePath, syncSelectedThreadBranchState],
+    [
+      actions.vcs,
+      runSelectedThreadGitMutation,
+      selectedThreadWorktreePath,
+      syncSelectedThreadBranchState,
+    ],
   );
 
   const onCreateSelectedThreadBranch = useCallback(
     async (branch: string) => {
-      await runSelectedThreadGitMutation(async ({ thread, cwd }) => {
-        const result = await vcsActionManager.createRef(
-          { environmentId: thread.environmentId, cwd },
-          {
-            refName: branch,
-            switchRef: true,
-          },
-        );
-        await syncSelectedThreadBranchState({
-          thread,
-          cwd,
-          nextThreadState: {
-            branch: result?.refName ?? thread.branch,
-            worktreePath: selectedThreadWorktreePath,
-          },
-        });
-      });
+      await runSelectedThreadGitMutation(
+        "create_ref",
+        "Creating branch",
+        async ({ thread, cwd }) => {
+          const result = await actions.vcs.createRef({
+            environmentId: thread.environmentId,
+            input: { cwd, refName: branch, switchRef: true },
+          });
+          await syncSelectedThreadBranchState({
+            thread,
+            cwd,
+            nextThreadState: {
+              branch: result.refName ?? thread.branch,
+              worktreePath: selectedThreadWorktreePath,
+            },
+          });
+        },
+      );
     },
-    [runSelectedThreadGitMutation, selectedThreadWorktreePath, syncSelectedThreadBranchState],
+    [
+      actions.vcs,
+      runSelectedThreadGitMutation,
+      selectedThreadWorktreePath,
+      syncSelectedThreadBranchState,
+    ],
   );
 
   const onCreateSelectedThreadWorktree = useCallback(
     async (nextWorktree: { readonly baseBranch: string; readonly newBranch: string }) => {
-      await runSelectedThreadGitMutation(async ({ thread, project }) => {
-        const result = await vcsActionManager.createWorktree(
-          { environmentId: thread.environmentId, cwd: project.workspaceRoot },
-          {
-            refName: nextWorktree.baseBranch,
-            newRefName: sanitizeFeatureBranchName(nextWorktree.newBranch),
-            path: null,
-          },
-        );
-        if (!result) {
-          return;
-        }
-
-        await syncSelectedThreadBranchState({
-          thread,
-          cwd: result.worktree.path,
-          branchRootCwd: project.workspaceRoot,
-          nextThreadState: {
-            branch: result.worktree.refName,
-            worktreePath: result.worktree.path,
-          },
-        });
-      });
+      await runSelectedThreadGitMutation(
+        "create_worktree",
+        "Creating worktree",
+        async ({ thread, project }) => {
+          const result = await actions.vcs.createWorktree({
+            environmentId: thread.environmentId,
+            input: {
+              cwd: project.workspaceRoot,
+              refName: nextWorktree.baseBranch,
+              newRefName: sanitizeFeatureBranchName(nextWorktree.newBranch),
+              path: null,
+            },
+          });
+          await syncSelectedThreadBranchState({
+            thread,
+            cwd: result.worktree.path,
+            nextThreadState: {
+              branch: result.worktree.refName,
+              worktreePath: result.worktree.path,
+            },
+          });
+        },
+      );
     },
-    [runSelectedThreadGitMutation, syncSelectedThreadBranchState],
+    [actions.vcs, runSelectedThreadGitMutation, syncSelectedThreadBranchState],
   );
 
   const onPullSelectedThreadBranch = useCallback(async () => {
-    await runSelectedThreadGitMutation(async ({ thread, cwd }) => {
-      const result = await vcsActionManager.pull({ environmentId: thread.environmentId, cwd });
-      await refreshSelectedThreadGitStatus({ quiet: true, cwd });
-      if (result) {
+    await runSelectedThreadGitMutation(
+      "pull",
+      "Pulling latest changes",
+      async ({ thread, cwd }) => {
+        const result = await actions.vcs.pull({
+          environmentId: thread.environmentId,
+          input: { cwd },
+        });
+        await refreshSelectedThreadGitStatus({ quiet: true, cwd });
         showGitActionResult({
           type: "success",
           title:
@@ -271,57 +276,60 @@ export function useSelectedThreadGitActions() {
               ? "Already up to date"
               : `Pulled latest on ${result.refName}`,
         });
-      }
-    });
-  }, [refreshSelectedThreadGitStatus, runSelectedThreadGitMutation]);
+      },
+    );
+  }, [actions.vcs, refreshSelectedThreadGitStatus, runSelectedThreadGitMutation]);
 
   const onRunSelectedThreadGitAction = useCallback(
     async (input: GitActionRequestInput): Promise<GitRunStackedActionResult | null> => {
-      return await runSelectedThreadGitMutation(async ({ thread, cwd }) => {
-        const result = await vcsActionManager.runChangeRequest(
-          { environmentId: thread.environmentId, cwd },
-          {
-            actionId: uuidv4(),
-            action: input.action,
-            ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
-            ...(input.featureBranch ? { featureBranch: input.featureBranch } : {}),
-            ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
-          },
-          {
-            gitStatus: vcsStatusManager.getSnapshot({
-              environmentId: thread.environmentId,
+      return await runSelectedThreadGitMutation(
+        "run_change_request",
+        "Running source control action",
+        async ({ thread, cwd }) => {
+          const event = await actions.git.runStackedAction({
+            environmentId: thread.environmentId,
+            input: {
               cwd,
-            }).data,
-          },
-        );
-        if (!result) {
-          return null;
-        }
-
-        showGitActionResult({
-          type: "success",
-          title: result.toast.title,
-          description: result.toast.description,
-          prUrl: result.toast.cta.kind === "open_pr" ? result.toast.cta.url : undefined,
-        });
-
-        if (result.branch.status === "created" && result.branch.name) {
-          await syncSelectedThreadBranchState({
-            thread,
-            cwd,
-            nextThreadState: {
-              branch: result.branch.name,
-              worktreePath: selectedThreadWorktreePath,
+              actionId: uuidv4(),
+              action: input.action,
+              ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
+              ...(input.featureBranch ? { featureBranch: input.featureBranch } : {}),
+              ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
             },
           });
-          return result;
-        }
+          if (event.kind === "action_failed") {
+            throw new Error(event.message);
+          }
+          if (event.kind !== "action_finished") {
+            throw new Error("Source control action ended without a result.");
+          }
 
-        await refreshSelectedThreadGitStatus({ quiet: true, cwd });
-        return result;
-      });
+          const result = event.result;
+          showGitActionResult({
+            type: "success",
+            title: result.toast.title,
+            description: result.toast.description,
+            prUrl: result.toast.cta.kind === "open_pr" ? result.toast.cta.url : undefined,
+          });
+
+          if (result.branch.status === "created" && result.branch.name) {
+            await syncSelectedThreadBranchState({
+              thread,
+              cwd,
+              nextThreadState: {
+                branch: result.branch.name,
+                worktreePath: selectedThreadWorktreePath,
+              },
+            });
+          } else {
+            await refreshSelectedThreadGitStatus({ quiet: true, cwd });
+          }
+          return result;
+        },
+      );
     },
     [
+      actions.git,
       refreshSelectedThreadGitStatus,
       runSelectedThreadGitMutation,
       selectedThreadWorktreePath,

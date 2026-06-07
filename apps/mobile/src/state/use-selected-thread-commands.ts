@@ -1,16 +1,12 @@
 import { useCallback } from "react";
 
 import {
-  CommandId,
   type ModelSelection,
   type ProviderInteractionMode,
   type RuntimeMode,
 } from "@t3tools/contracts";
 
-import { uuidv4 } from "../lib/uuid";
-import { environmentRuntimeManager } from "./use-environment-runtime";
-import { getEnvironmentClient } from "./environment-session-registry";
-import { useRemoteEnvironmentState } from "./use-remote-environment-registry";
+import { useMobileActions } from "../connection/useMobileEnvironmentData";
 import { useThreadSelection } from "./use-thread-selection";
 
 export function useSelectedThreadCommands(input: {
@@ -19,43 +15,15 @@ export function useSelectedThreadCommands(input: {
     readonly cwd?: string | null;
   }) => Promise<unknown>;
 }) {
+  const actions = useMobileActions();
   const { refreshSelectedThreadGitStatus } = input;
   const { selectedThread } = useThreadSelection();
-  const { savedConnectionsById } = useRemoteEnvironmentState();
 
   const onRefresh = useCallback(async () => {
-    const targets = selectedThread
-      ? [selectedThread.environmentId]
-      : Object.values(savedConnectionsById).map((connection) => connection.environmentId);
-
-    await Promise.all(
-      targets.map(async (environmentId) => {
-        const client = getEnvironmentClient(environmentId);
-        if (!client) {
-          return;
-        }
-
-        try {
-          const serverConfig = await client.server.getConfig();
-          environmentRuntimeManager.patch({ environmentId }, (current) => ({
-            ...current,
-            serverConfig,
-            connectionError: null,
-          }));
-        } catch (error) {
-          environmentRuntimeManager.patch({ environmentId }, (current) => ({
-            ...current,
-            connectionError:
-              error instanceof Error ? error.message : "Failed to refresh remote data.",
-          }));
-        }
-      }),
-    );
-
     if (selectedThread) {
       await refreshSelectedThreadGitStatus({ quiet: true });
     }
-  }, [refreshSelectedThreadGitStatus, savedConnectionsById, selectedThread]);
+  }, [refreshSelectedThreadGitStatus, selectedThread]);
 
   const onUpdateThreadModelSelection = useCallback(
     async (modelSelection: ModelSelection) => {
@@ -63,19 +31,15 @@ export function useSelectedThreadCommands(input: {
         return;
       }
 
-      const client = getEnvironmentClient(selectedThread.environmentId);
-      if (!client) {
-        return;
-      }
-
-      await client.orchestration.dispatchCommand({
-        type: "thread.meta.update",
-        commandId: CommandId.make(uuidv4()),
-        threadId: selectedThread.id,
-        modelSelection,
+      await actions.threads.updateMetadata({
+        environmentId: selectedThread.environmentId,
+        input: {
+          threadId: selectedThread.id,
+          modelSelection,
+        },
       });
     },
-    [selectedThread],
+    [actions.threads, selectedThread],
   );
 
   const onUpdateThreadRuntimeMode = useCallback(
@@ -84,20 +48,15 @@ export function useSelectedThreadCommands(input: {
         return;
       }
 
-      const client = getEnvironmentClient(selectedThread.environmentId);
-      if (!client) {
-        return;
-      }
-
-      await client.orchestration.dispatchCommand({
-        type: "thread.runtime-mode.set",
-        commandId: CommandId.make(uuidv4()),
-        threadId: selectedThread.id,
-        runtimeMode,
-        createdAt: new Date().toISOString(),
+      await actions.threads.setRuntimeMode({
+        environmentId: selectedThread.environmentId,
+        input: {
+          threadId: selectedThread.id,
+          runtimeMode,
+        },
       });
     },
-    [selectedThread],
+    [actions.threads, selectedThread],
   );
 
   const onUpdateThreadInteractionMode = useCallback(
@@ -106,29 +65,19 @@ export function useSelectedThreadCommands(input: {
         return;
       }
 
-      const client = getEnvironmentClient(selectedThread.environmentId);
-      if (!client) {
-        return;
-      }
-
-      await client.orchestration.dispatchCommand({
-        type: "thread.interaction-mode.set",
-        commandId: CommandId.make(uuidv4()),
-        threadId: selectedThread.id,
-        interactionMode,
-        createdAt: new Date().toISOString(),
+      await actions.threads.setInteractionMode({
+        environmentId: selectedThread.environmentId,
+        input: {
+          threadId: selectedThread.id,
+          interactionMode,
+        },
       });
     },
-    [selectedThread],
+    [actions.threads, selectedThread],
   );
 
   const onStopThread = useCallback(async () => {
     if (!selectedThread) {
-      return;
-    }
-
-    const client = getEnvironmentClient(selectedThread.environmentId);
-    if (!client) {
       return;
     }
 
@@ -139,25 +88,20 @@ export function useSelectedThreadCommands(input: {
       return;
     }
 
-    await client.orchestration.dispatchCommand({
-      type: "thread.turn.interrupt",
-      commandId: CommandId.make(uuidv4()),
-      threadId: selectedThread.id,
-      ...(selectedThread.session?.activeTurnId
-        ? { turnId: selectedThread.session.activeTurnId }
-        : {}),
-      createdAt: new Date().toISOString(),
+    await actions.threads.interruptTurn({
+      environmentId: selectedThread.environmentId,
+      input: {
+        threadId: selectedThread.id,
+        ...(selectedThread.session?.activeTurnId
+          ? { turnId: selectedThread.session.activeTurnId }
+          : {}),
+      },
     });
-  }, [selectedThread]);
+  }, [actions.threads, selectedThread]);
 
   const onRenameThread = useCallback(
     async (title: string) => {
       if (!selectedThread) {
-        return;
-      }
-
-      const client = getEnvironmentClient(selectedThread.environmentId);
-      if (!client) {
         return;
       }
 
@@ -166,14 +110,15 @@ export function useSelectedThreadCommands(input: {
         return;
       }
 
-      await client.orchestration.dispatchCommand({
-        type: "thread.meta.update",
-        commandId: CommandId.make(uuidv4()),
-        threadId: selectedThread.id,
-        title: trimmed,
+      await actions.threads.updateMetadata({
+        environmentId: selectedThread.environmentId,
+        input: {
+          threadId: selectedThread.id,
+          title: trimmed,
+        },
       });
     },
-    [selectedThread],
+    [actions.threads, selectedThread],
   );
 
   return {

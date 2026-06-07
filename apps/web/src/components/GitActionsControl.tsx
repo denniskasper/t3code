@@ -62,7 +62,7 @@ import { ScrollArea } from "~/components/ui/scroll-area";
 import { Textarea } from "~/components/ui/textarea";
 import { stackedThreadToast, toastManager, type ThreadToastData } from "~/components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
-import { openInPreferredEditor } from "~/editorPreferences";
+import { useOpenInPreferredEditor } from "~/editorPreferences";
 import {
   useGitStackedAction,
   useSourceControlActionRunning,
@@ -70,12 +70,12 @@ import {
   useVcsInitAction,
   useVcsPullAction,
 } from "~/lib/sourceControlActions";
-import { refreshVcsStatus, useVcsStatus } from "~/lib/vcsStatusState";
+import { useWebRepositoryStatus } from "~/connection/webAppQueries";
+import { useWebActions, useWebServerConfig } from "~/connection/useWebEnvironmentData";
 import { useSourceControlDiscovery } from "~/lib/sourceControlDiscoveryState";
-import { newCommandId, randomUUID } from "~/lib/utils";
+import { randomUUID } from "~/lib/utils";
 import { resolvePathLinkTarget } from "~/terminal-links";
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
-import { readEnvironmentApi } from "~/environmentApi";
 import { readLocalApi } from "~/localApi";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useStore } from "~/store";
@@ -478,9 +478,6 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
           setPublishResult(result);
           setPublishWizardStep(2);
         });
-        void refreshVcsStatus({ environmentId: props.environmentId, cwd: props.gitCwd }).catch(
-          () => undefined,
-        );
       })
       .catch((err: unknown) => {
         setPublishError(err instanceof Error ? err.message : "An error occurred.");
@@ -950,7 +947,13 @@ export default function GitActionsControl({
   activeThreadRef,
   draftId,
 }: GitActionsControlProps) {
+  const actions = useWebActions();
   const activeEnvironmentId = activeThreadRef?.environmentId ?? null;
+  const serverConfig = useWebServerConfig(activeEnvironmentId);
+  const openInPreferredEditor = useOpenInPreferredEditor(
+    activeEnvironmentId,
+    serverConfig.data?.availableEditors ?? [],
+  );
   const threadToastData = useMemo(
     () => (activeThreadRef ? { threadRef: activeThreadRef } : undefined),
     [activeThreadRef],
@@ -1009,18 +1012,16 @@ export default function GitActionsControl({
         }
 
         const worktreePath = activeServerThread.worktreePath;
-        const api = readEnvironmentApi(activeThreadRef.environmentId);
-        if (api) {
-          void api.orchestration
-            .dispatchCommand({
-              type: "thread.meta.update",
-              commandId: newCommandId(),
+        void actions.threads
+          .updateMetadata({
+            environmentId: activeThreadRef.environmentId,
+            input: {
               threadId: activeThreadRef.threadId,
               branch,
               worktreePath,
-            })
-            .catch(() => undefined);
-        }
+            },
+          })
+          .catch(() => undefined);
 
         setThreadBranch(activeThreadRef, branch, worktreePath);
         return;
@@ -1039,6 +1040,7 @@ export default function GitActionsControl({
       activeDraftThread,
       activeServerThread,
       activeThreadRef,
+      actions.threads,
       draftId,
       setDraftThreadContext,
       setThreadBranch,
@@ -1057,10 +1059,11 @@ export default function GitActionsControl({
     [persistThreadBranchSync],
   );
 
-  const { data: gitStatus, error: gitStatusError } = useVcsStatus({
+  const gitStatusQuery = useWebRepositoryStatus({
     environmentId: activeEnvironmentId,
     cwd: gitCwd,
   });
+  const { data: gitStatus, error: gitStatusError } = gitStatusQuery;
   const sourceControlPresentation = useMemo(
     () => getSourceControlPresentation(gitStatus?.sourceControlProvider),
     [gitStatus?.sourceControlProvider],
@@ -1162,9 +1165,7 @@ export default function GitActionsControl({
       }
       refreshTimeout = window.setTimeout(() => {
         refreshTimeout = null;
-        void refreshVcsStatus({ environmentId: activeEnvironmentId, cwd: gitCwd }).catch(
-          () => undefined,
-        );
+        gitStatusQuery.refresh();
       }, GIT_STATUS_WINDOW_REFRESH_DEBOUNCE_MS);
     };
     const handleVisibilityChange = () => {
@@ -1183,7 +1184,7 @@ export default function GitActionsControl({
       window.removeEventListener("focus", scheduleRefreshCurrentGitStatus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [activeEnvironmentId, gitCwd]);
+  }, [gitCwd, gitStatusQuery.refresh]);
 
   const openExistingPr = useCallback(async () => {
     const api = readLocalApi();
@@ -1572,8 +1573,7 @@ export default function GitActionsControl({
 
   const openChangedFileInEditor = useCallback(
     (filePath: string) => {
-      const api = readLocalApi();
-      if (!api || !gitCwd) {
+      if (!gitCwd) {
         toastManager.add({
           type: "error",
           title: "Editor opening is unavailable.",
@@ -1582,7 +1582,7 @@ export default function GitActionsControl({
         return;
       }
       const target = resolvePathLinkTarget(filePath, gitCwd);
-      void openInPreferredEditor(api, target).catch((error) => {
+      void openInPreferredEditor(target).catch((error) => {
         toastManager.add(
           stackedThreadToast({
             type: "error",
@@ -1593,7 +1593,7 @@ export default function GitActionsControl({
         );
       });
     },
-    [gitCwd, threadToastData],
+    [gitCwd, openInPreferredEditor, threadToastData],
   );
 
   const canPublishRepository = isRepo && gitStatusForActions !== null && !hasPrimaryRemote;
@@ -1657,10 +1657,7 @@ export default function GitActionsControl({
           <Menu
             onOpenChange={(open) => {
               if (open) {
-                void refreshVcsStatus({
-                  environmentId: activeEnvironmentId,
-                  cwd: gitCwd,
-                }).catch(() => undefined);
+                gitStatusQuery.refresh();
               }
             }}
           >
@@ -1741,7 +1738,7 @@ export default function GitActionsControl({
                   </p>
                 )}
               {gitStatusError && (
-                <p className="px-2 py-1.5 text-xs text-destructive">{gitStatusError.message}</p>
+                <p className="px-2 py-1.5 text-xs text-destructive">{gitStatusError}</p>
               )}
             </MenuPopup>
           </Menu>

@@ -3,7 +3,8 @@ import { DownloadIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { type ProviderDriverKind, type ProviderInstanceId } from "@t3tools/contracts";
 
-import { ensureLocalApi } from "../localApi";
+import { useWebActions } from "../connection/useWebEnvironmentData";
+import { useWebPrimaryEnvironment } from "../connection/useWebEnvironments";
 import { useDismissedProviderUpdateNotificationKeys } from "../providerUpdateDismissal";
 import { useServerProviders } from "../rpc/serverState";
 import { PROVIDER_ICON_BY_PROVIDER } from "./chat/providerIconUtils";
@@ -102,6 +103,8 @@ function isTerminalProviderUpdateToastView(view: ProviderUpdateToastView) {
 export function ProviderUpdateLaunchNotification() {
   const navigate = useNavigate();
   const providers = useServerProviders();
+  const primaryEnvironment = useWebPrimaryEnvironment();
+  const actions = useWebActions();
   const activeToastRef = useRef<ActiveProviderUpdateToast | null>(null);
   const { dismissedNotificationKeys, dismissNotificationKey } =
     useDismissedProviderUpdateNotificationKeys();
@@ -185,7 +188,7 @@ export function ProviderUpdateLaunchNotification() {
     };
 
     const runUpdates = () => {
-      if (updateStarted || oneClickProviders.length === 0) {
+      if (updateStarted || oneClickProviders.length === 0 || !primaryEnvironment) {
         return;
       }
       updateStarted = true;
@@ -208,9 +211,12 @@ export function ProviderUpdateLaunchNotification() {
 
       void Promise.allSettled(
         oneClickProviders.map(async (provider) =>
-          ensureLocalApi().server.updateProvider({
-            provider: provider.driver,
-            instanceId: provider.instanceId,
+          actions.server.updateProvider({
+            environmentId: primaryEnvironment.environmentId,
+            input: {
+              provider: provider.driver,
+              instanceId: provider.instanceId,
+            },
           }),
         ),
       ).then((results) => {
@@ -288,11 +294,13 @@ export function ProviderUpdateLaunchNotification() {
     );
     activeToastRef.current = { kind: "prompt", key: notificationKey, toastId };
   }, [
+    actions.server,
     dismissNotificationKey,
     dismissedNotificationKeys,
     notificationKey,
     oneClickProviders,
     openProviderSettings,
+    primaryEnvironment,
     updateProviders,
   ]);
 

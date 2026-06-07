@@ -6,41 +6,22 @@ import {
   ProjectId,
   ThreadId,
   type ServerConfig,
-  type ServerConfigStreamEvent,
-  type ServerLifecycleStreamEvent,
   type ServerProvider,
 } from "@t3tools/contracts";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  applyServerConfigEvent,
+  emitWelcome,
   getServerConfig,
   getServerKeybindings,
   onProvidersUpdated,
   onServerConfigUpdated,
   onWelcome,
   resetServerStateForTests,
-  startServerStateSync,
+  setServerConfigSnapshot,
 } from "./serverState";
-
-function registerListener<T>(listeners: Set<(event: T) => void>, listener: (event: T) => void) {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-  };
-}
-
-function createDeferredPromise<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((nextResolve) => {
-    resolve = nextResolve;
-  });
-
-  return { promise, resolve };
-}
-
-const lifecycleListeners = new Set<(event: ServerLifecycleStreamEvent) => void>();
-const configListeners = new Set<(event: ServerConfigStreamEvent) => void>();
 
 const defaultProviders: ReadonlyArray<ServerProvider> = [
   {
@@ -94,47 +75,7 @@ const baseServerConfig: ServerConfig = {
   settings: DEFAULT_SERVER_SETTINGS,
 };
 
-const serverApi = {
-  getConfig: vi.fn<() => Promise<ServerConfig>>(),
-  subscribeConfig: vi.fn((listener: (event: ServerConfigStreamEvent) => void) =>
-    registerListener(configListeners, listener),
-  ),
-  subscribeLifecycle: vi.fn((listener: (event: ServerLifecycleStreamEvent) => void) =>
-    registerListener(lifecycleListeners, listener),
-  ),
-};
-
-function emitLifecycleEvent(event: ServerLifecycleStreamEvent) {
-  for (const listener of lifecycleListeners) {
-    listener(event);
-  }
-}
-
-function emitServerConfigEvent(event: ServerConfigStreamEvent) {
-  for (const listener of configListeners) {
-    listener(event);
-  }
-}
-
-async function waitFor(assertion: () => void, timeoutMs = 1_000): Promise<void> {
-  const startedAt = Date.now();
-  for (;;) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      if (Date.now() - startedAt >= timeoutMs) {
-        throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-}
-
 beforeEach(() => {
-  vi.clearAllMocks();
-  lifecycleListeners.clear();
-  configListeners.clear();
   resetServerStateForTests();
 });
 
@@ -148,21 +89,14 @@ describe("serverState", () => {
     expect(getServerKeybindings()).toEqual(DEFAULT_RESOLVED_KEYBINDINGS);
   });
 
-  it("bootstraps the server config snapshot and replays it to late subscribers", async () => {
-    serverApi.getConfig.mockResolvedValueOnce(baseServerConfig);
+  it("projects a server config snapshot and replays it to late subscribers", () => {
+    setServerConfigSnapshot(baseServerConfig);
 
-    const configListener = vi.fn();
-    const stop = startServerStateSync(serverApi);
-    const unsubscribe = onServerConfigUpdated(configListener);
+    expect(getServerConfig()).toEqual(baseServerConfig);
 
-    await waitFor(() => {
-      expect(getServerConfig()).toEqual(baseServerConfig);
-    });
-
-    expect(serverApi.subscribeConfig).toHaveBeenCalledOnce();
-    expect(serverApi.subscribeLifecycle).toHaveBeenCalledOnce();
-    expect(serverApi.getConfig).toHaveBeenCalledOnce();
-    expect(configListener).toHaveBeenCalledWith(
+    const listener = vi.fn();
+    const unsubscribe = onServerConfigUpdated(listener);
+    expect(listener).toHaveBeenCalledWith(
       {
         issues: [],
         providers: defaultProviders,
@@ -170,104 +104,32 @@ describe("serverState", () => {
       },
       "snapshot",
     );
-
-    const lateListener = vi.fn();
-    const unsubscribeLate = onServerConfigUpdated(lateListener);
-    expect(lateListener).toHaveBeenCalledWith(
-      {
-        issues: [],
-        providers: defaultProviders,
-        settings: DEFAULT_SERVER_SETTINGS,
-      },
-      "snapshot",
-    );
-
-    unsubscribeLate();
     unsubscribe();
-    stop();
   });
 
-  it("keeps the streamed snapshot when it arrives before the fallback fetch resolves", async () => {
-    const deferred = createDeferredPromise<ServerConfig>();
-    serverApi.getConfig.mockReturnValueOnce(deferred.promise);
-    const stop = startServerStateSync(serverApi);
-
-    const streamedConfig: ServerConfig = {
-      ...baseServerConfig,
-      cwd: "/tmp/from-stream",
+  it("projects welcome events and replays the latest value", () => {
+    const payload = {
+      environment: baseEnvironment,
+      cwd: "/tmp/workspace",
+      projectName: "t3-code",
+      bootstrapProjectId: ProjectId.make("project-1"),
+      bootstrapThreadId: ThreadId.make("thread-1"),
     };
 
-    emitServerConfigEvent({
-      version: 1,
-      type: "snapshot",
-      config: streamedConfig,
-    });
-
-    await waitFor(() => {
-      expect(getServerConfig()).toEqual(streamedConfig);
-    });
-
-    deferred.resolve(baseServerConfig);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(getServerConfig()).toEqual(streamedConfig);
-    stop();
-  });
-
-  it("replays welcome events to late subscribers", async () => {
-    serverApi.getConfig.mockResolvedValueOnce(baseServerConfig);
-    const stop = startServerStateSync(serverApi);
+    emitWelcome(payload);
 
     const listener = vi.fn();
     const unsubscribe = onWelcome(listener);
-
-    emitLifecycleEvent({
-      version: 1,
-      sequence: 1,
-      type: "welcome",
-      payload: {
-        environment: baseEnvironment,
-        cwd: "/tmp/workspace",
-        projectName: "t3-code",
-        bootstrapProjectId: ProjectId.make("project-1"),
-        bootstrapThreadId: ThreadId.make("thread-1"),
-      },
-    });
-
-    expect(listener).toHaveBeenCalledWith({
-      environment: baseEnvironment,
-      cwd: "/tmp/workspace",
-      projectName: "t3-code",
-      bootstrapProjectId: ProjectId.make("project-1"),
-      bootstrapThreadId: ThreadId.make("thread-1"),
-    });
-
-    const lateListener = vi.fn();
-    const unsubscribeLate = onWelcome(lateListener);
-    expect(lateListener).toHaveBeenCalledWith({
-      environment: baseEnvironment,
-      cwd: "/tmp/workspace",
-      projectName: "t3-code",
-      bootstrapProjectId: ProjectId.make("project-1"),
-      bootstrapThreadId: ThreadId.make("thread-1"),
-    });
-
-    unsubscribeLate();
+    expect(listener).toHaveBeenCalledWith(payload);
     unsubscribe();
-    stop();
   });
 
-  it("merges provider, settings, and keybinding updates into the cached config", async () => {
-    serverApi.getConfig.mockResolvedValueOnce(baseServerConfig);
+  it("merges provider, settings, and keybinding events into the projected config", () => {
+    setServerConfigSnapshot(baseServerConfig);
     const configListener = vi.fn();
     const providersListener = vi.fn();
-    const stop = startServerStateSync(serverApi);
     const unsubscribeConfig = onServerConfigUpdated(configListener);
     const unsubscribeProviders = onProvidersUpdated(providersListener);
-
-    await waitFor(() => {
-      expect(getServerConfig()).toEqual(baseServerConfig);
-    });
 
     const nextProviders: ReadonlyArray<ServerProvider> = [
       {
@@ -277,7 +139,6 @@ describe("serverState", () => {
         message: "rate limited",
       },
     ];
-
     const nextKeybindings = [
       {
         command: "commandPalette.toggle",
@@ -292,7 +153,7 @@ describe("serverState", () => {
       },
     ] as const;
 
-    emitServerConfigEvent({
+    applyServerConfigEvent({
       version: 1,
       type: "keybindingsUpdated",
       payload: {
@@ -300,14 +161,14 @@ describe("serverState", () => {
         issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
       },
     });
-    emitServerConfigEvent({
+    applyServerConfigEvent({
       version: 1,
       type: "providerStatuses",
       payload: {
         providers: nextProviders,
       },
     });
-    emitServerConfigEvent({
+    applyServerConfigEvent({
       version: 1,
       type: "settingsUpdated",
       payload: {
@@ -318,38 +179,17 @@ describe("serverState", () => {
       },
     });
 
-    await waitFor(() => {
-      expect(getServerConfig()).toEqual({
-        ...baseServerConfig,
-        keybindings: nextKeybindings,
-        issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
-        providers: nextProviders,
-        settings: {
-          ...DEFAULT_SERVER_SETTINGS,
-          enableAssistantStreaming: true,
-        },
-      });
+    expect(getServerConfig()).toEqual({
+      ...baseServerConfig,
+      keybindings: nextKeybindings,
+      issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
+      providers: nextProviders,
+      settings: {
+        ...DEFAULT_SERVER_SETTINGS,
+        enableAssistantStreaming: true,
+      },
     });
-
     expect(providersListener).toHaveBeenLastCalledWith({ providers: nextProviders });
-    expect(configListener).toHaveBeenNthCalledWith(
-      2,
-      {
-        issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
-        providers: defaultProviders,
-        settings: DEFAULT_SERVER_SETTINGS,
-      },
-      "keybindingsUpdated",
-    );
-    expect(configListener).toHaveBeenNthCalledWith(
-      3,
-      {
-        issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
-        providers: nextProviders,
-        settings: DEFAULT_SERVER_SETTINGS,
-      },
-      "providerStatuses",
-    );
     expect(configListener).toHaveBeenLastCalledWith(
       {
         issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
@@ -364,6 +204,5 @@ describe("serverState", () => {
 
     unsubscribeProviders();
     unsubscribeConfig();
-    stop();
   });
 });

@@ -40,8 +40,6 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { useShallow } from "zustand/react/shallow";
 import { useVcsStatus } from "~/lib/vcsStatusState";
-import { usePrimaryEnvironmentId } from "../environments/primary";
-import { readEnvironmentApi } from "../environmentApi";
 import { isElectron } from "../env";
 import { readLocalApi } from "../localApi";
 import { parseDiffRouteSearch, stripDiffSearchParams } from "../diffRouteSearch";
@@ -115,7 +113,7 @@ import {
   nextProjectScriptId,
   projectScriptIdFromCommand,
 } from "~/projectScripts";
-import { newCommandId, newDraftId, newMessageId, newThreadId } from "~/lib/utils";
+import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useSettings } from "../hooks/useSettings";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
@@ -124,11 +122,6 @@ import {
   deriveLogicalProjectKeyFromSettings,
   selectProjectGroupingSettings,
 } from "../logicalProject";
-import {
-  reconnectSavedEnvironment,
-  useSavedEnvironmentRegistryStore,
-  useSavedEnvironmentRuntimeStore,
-} from "../environments/runtime";
 import { buildDraftThreadRouteParams } from "../threadRoutes";
 import {
   type ComposerImageAttachment,
@@ -143,7 +136,18 @@ import {
   type TerminalContextSelection,
 } from "../lib/terminalContext";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
-import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../terminalSessionState";
+import {
+  useWebKnownTerminalSessions,
+  useWebThreadRunningTerminalIds,
+} from "../connection/webTerminalSessions";
+import { useWebActions } from "../connection/useWebEnvironmentData";
+import { useWebThreadDetail } from "../connection/webAppQueries";
+import {
+  useWebEnvironmentActions,
+  useWebEnvironmentHttpBaseUrl,
+  useWebEnvironments,
+  useWebPrimaryEnvironment,
+} from "../connection/useWebEnvironments";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
@@ -151,7 +155,7 @@ import { MessagesTimeline } from "./chat/MessagesTimeline";
 import { ChatHeader } from "./chat/ChatHeader";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
-import { resolveEffectiveEnvMode, resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
+import { resolveEffectiveEnvMode } from "./BranchToolbar.logic";
 import { ProviderStatusBanner } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
@@ -179,13 +183,8 @@ import {
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
-import {
-  useServerAvailableEditors,
-  useServerConfig,
-  useServerKeybindings,
-} from "~/rpc/serverState";
+import { useServerAvailableEditors, useServerKeybindings } from "~/rpc/serverState";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
-import { retainThreadDetailSubscription } from "../environments/runtime/service";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { Button } from "./ui/button";
 import {
@@ -494,6 +493,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   keybindings,
   onAddTerminalContext,
 }: PersistentThreadTerminalDrawerProps) {
+  const actions = useWebActions();
   const serverThread = useStore(useMemo(() => createThreadSelectorByRef(threadRef), [threadRef]));
   const draftThread = useComposerDraftStore((store) => store.getDraftThreadByRef(threadRef));
   const projectRef = serverThread
@@ -505,7 +505,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   const terminalUiState = useTerminalUiStateStore((state) =>
     selectThreadTerminalUiState(state.terminalUiStateByThreadKey, threadRef),
   );
-  const knownTerminalSessions = useKnownTerminalSessions({
+  const knownTerminalSessions = useWebKnownTerminalSessions({
     environmentId: threadRef.environmentId,
     threadId,
   });
@@ -618,8 +618,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   );
 
   const splitTerminal = useCallback(() => {
-    const api = readEnvironmentApi(threadRef.environmentId);
-    if (!api || !cwd) {
+    if (!cwd) {
       return;
     }
     const terminalId = nextTerminalId(serverOrderedTerminalIds);
@@ -627,18 +626,22 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     bumpFocusRequestId();
     void (async () => {
       try {
-        await api.terminal.open({
-          threadId,
-          terminalId,
-          cwd,
-          ...(effectiveWorktreePath != null ? { worktreePath: effectiveWorktreePath } : {}),
-          env: runtimeEnv,
+        await actions.terminal.open({
+          environmentId: threadRef.environmentId,
+          input: {
+            threadId,
+            terminalId,
+            cwd,
+            ...(effectiveWorktreePath != null ? { worktreePath: effectiveWorktreePath } : {}),
+            env: runtimeEnv,
+          },
         });
       } catch {
         // Opening failed; the tab is already in the store — user can retry or close it.
       }
     })();
   }, [
+    actions.terminal,
     bumpFocusRequestId,
     cwd,
     effectiveWorktreePath,
@@ -650,8 +653,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   ]);
 
   const createNewTerminal = useCallback(() => {
-    const api = readEnvironmentApi(threadRef.environmentId);
-    if (!api || !cwd) {
+    if (!cwd) {
       return;
     }
     const terminalId = nextTerminalId(serverOrderedTerminalIds);
@@ -659,18 +661,22 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     bumpFocusRequestId();
     void (async () => {
       try {
-        await api.terminal.open({
-          threadId,
-          terminalId,
-          cwd,
-          ...(effectiveWorktreePath != null ? { worktreePath: effectiveWorktreePath } : {}),
-          env: runtimeEnv,
+        await actions.terminal.open({
+          environmentId: threadRef.environmentId,
+          input: {
+            threadId,
+            terminalId,
+            cwd,
+            ...(effectiveWorktreePath != null ? { worktreePath: effectiveWorktreePath } : {}),
+            env: runtimeEnv,
+          },
         });
       } catch {
         // Opening failed; the tab is already in the store — user can retry or close it.
       }
     })();
   }, [
+    actions.terminal,
     bumpFocusRequestId,
     cwd,
     effectiveWorktreePath,
@@ -691,31 +697,45 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
 
   const closeTerminal = useCallback(
     (terminalId: string) => {
-      const api = readEnvironmentApi(threadRef.environmentId);
-      if (!api) return;
       const isFinalTerminal = terminalUiState.terminalIds.length <= 1;
       const fallbackExitWrite = () =>
-        api.terminal.write({ threadId, terminalId, data: "exit\n" }).catch(() => undefined);
+        actions.terminal
+          .write({
+            environmentId: threadRef.environmentId,
+            input: { threadId, terminalId, data: "exit\n" },
+          })
+          .catch(() => undefined);
 
-      if ("close" in api.terminal && typeof api.terminal.close === "function") {
-        void (async () => {
-          if (isFinalTerminal) {
-            await api.terminal.clear({ threadId, terminalId }).catch(() => undefined);
-          }
-          await api.terminal.close({
+      void (async () => {
+        if (isFinalTerminal) {
+          await actions.terminal
+            .clear({
+              environmentId: threadRef.environmentId,
+              input: { threadId, terminalId },
+            })
+            .catch(() => undefined);
+        }
+        await actions.terminal.close({
+          environmentId: threadRef.environmentId,
+          input: {
             threadId,
             terminalId,
             deleteHistory: true,
-          });
-        })().catch(() => fallbackExitWrite());
-      } else {
-        void fallbackExitWrite();
-      }
+          },
+        });
+      })().catch(() => fallbackExitWrite());
 
       storeCloseTerminal(threadRef, terminalId);
       bumpFocusRequestId();
     },
-    [bumpFocusRequestId, storeCloseTerminal, terminalUiState.terminalIds, threadId, threadRef],
+    [
+      actions.terminal,
+      bumpFocusRequestId,
+      storeCloseTerminal,
+      terminalUiState.terminalIds,
+      threadId,
+      threadRef,
+    ],
   );
 
   const handleAddTerminalContext = useCallback(
@@ -779,6 +799,19 @@ export default function ChatView(props: ChatViewProps) {
     [environmentId, threadId],
   );
   const routeThreadKey = useMemo(() => scopedThreadKey(routeThreadRef), [routeThreadRef]);
+  const actions = useWebActions();
+  const { environments } = useWebEnvironments();
+  const primaryEnvironment = useWebPrimaryEnvironment();
+  const { retryEnvironment } = useWebEnvironmentActions();
+  const environmentById = useMemo(
+    () => new Map(environments.map((environment) => [environment.environmentId, environment])),
+    [environments],
+  );
+  const routeThreadDetail = useWebThreadDetail(
+    routeKind === "server" ? environmentId : null,
+    routeKind === "server" ? threadId : null,
+  );
+  const environmentHttpBaseUrl = useWebEnvironmentHttpBaseUrl(environmentId);
   const composerDraftTarget: ScopedThreadRef | DraftId =
     routeKind === "server" ? routeThreadRef : props.draftId;
   const serverThread = useStore(
@@ -788,6 +821,13 @@ export default function ChatView(props: ChatViewProps) {
     ),
   );
   const setStoreThreadError = useStore((store) => store.setError);
+  useEffect(() => {
+    if (routeThreadDetail.data !== null) {
+      useStore
+        .getState()
+        .syncServerThreadDetail(routeThreadDetail.data, environmentId, environmentHttpBaseUrl);
+    }
+  }, [environmentHttpBaseUrl, environmentId, routeThreadDetail.data]);
   const markThreadVisited = useUiStateStore((store) => store.markThreadVisited);
   const activeThreadLastVisitedAt = useUiStateStore((store) =>
     routeKind === "server" ? store.threadLastVisitedAtById[routeThreadKey] : undefined,
@@ -969,11 +1009,11 @@ export default function ChatView(props: ChatViewProps) {
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
   const diffOpen = rawSearch.diff === "1";
   const activeThreadId = activeThread?.id ?? null;
-  const runningTerminalIds = useThreadRunningTerminalIds({
+  const runningTerminalIds = useWebThreadRunningTerminalIds({
     environmentId: activeThread?.environmentId ?? null,
     threadId: activeThreadId,
   });
-  const activeThreadKnownSessionsRaw = useKnownTerminalSessions({
+  const activeThreadKnownSessionsRaw = useWebKnownTerminalSessions({
     environmentId: activeThread?.environmentId ?? null,
     threadId: activeThreadId,
   });
@@ -1064,64 +1104,36 @@ export default function ChatView(props: ChatViewProps) {
     useMemo(() => createProjectSelectorByRef(activeProjectRef), [activeProjectRef]),
   );
 
-  useEffect(() => {
-    if (routeKind !== "server") {
-      return;
-    }
-    return retainThreadDetailSubscription(environmentId, threadId);
-  }, [environmentId, routeKind, threadId]);
-
   // Compute the list of environments this logical project spans, used to
   // drive the environment picker in BranchToolbar.
   const allProjects = useStore(useShallow(selectProjectsAcrossEnvironments));
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const savedEnvironmentRegistry = useSavedEnvironmentRegistryStore((s) => s.byId);
-  const savedEnvironmentRuntimeById = useSavedEnvironmentRuntimeStore((s) => s.byId);
-  const activeSavedEnvironmentRecord =
-    activeThread && activeThread.environmentId !== primaryEnvironmentId
-      ? (savedEnvironmentRegistry[activeThread.environmentId] ?? null)
-      : null;
-  const activeSavedEnvironmentRuntime = activeSavedEnvironmentRecord
-    ? (savedEnvironmentRuntimeById[activeSavedEnvironmentRecord.environmentId] ?? null)
-    : null;
-  const activeSavedEnvironmentConnectionState = activeSavedEnvironmentRecord
-    ? (activeSavedEnvironmentRuntime?.connectionState ?? "disconnected")
-    : "connected";
+  const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
+  const activeEnvironment =
+    activeThread === undefined ? null : (environmentById.get(activeThread.environmentId) ?? null);
+  const activeEnvironmentConnectionPhase = activeEnvironment?.connection.phase ?? "available";
   const activeEnvironmentUnavailable =
-    activeSavedEnvironmentRecord !== null && activeSavedEnvironmentConnectionState !== "connected";
-  const activeSavedEnvironmentId = activeSavedEnvironmentRecord?.environmentId ?? null;
-  const activeEnvironmentUnavailableLabel = activeSavedEnvironmentRecord
-    ? resolveEnvironmentOptionLabel({
-        isPrimary: false,
-        environmentId: activeSavedEnvironmentRecord.environmentId,
-        runtimeLabel: activeSavedEnvironmentRuntime?.descriptor?.label ?? null,
-        savedLabel: activeSavedEnvironmentRecord.label,
-      })
-    : null;
+    activeEnvironment !== null && activeEnvironmentConnectionPhase !== "connected";
+  const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
   const activeEnvironmentUnavailableState = useMemo<EnvironmentUnavailableState | null>(() => {
-    if (
-      !activeEnvironmentUnavailable ||
-      !activeEnvironmentUnavailableLabel ||
-      !activeSavedEnvironmentId
-    ) {
+    if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
       return null;
     }
 
     return {
-      environmentId: activeSavedEnvironmentId,
+      environmentId: activeEnvironment.environmentId,
       label: activeEnvironmentUnavailableLabel,
       connectionState:
-        activeSavedEnvironmentConnectionState === "connecting" ||
-        activeSavedEnvironmentConnectionState === "reconnecting" ||
-        activeSavedEnvironmentConnectionState === "error"
-          ? activeSavedEnvironmentConnectionState
+        activeEnvironmentConnectionPhase === "connecting" ||
+        activeEnvironmentConnectionPhase === "reconnecting" ||
+        activeEnvironmentConnectionPhase === "error"
+          ? activeEnvironmentConnectionPhase
           : "disconnected",
     };
   }, [
+    activeEnvironment,
+    activeEnvironmentConnectionPhase,
     activeEnvironmentUnavailable,
     activeEnvironmentUnavailableLabel,
-    activeSavedEnvironmentConnectionState,
-    activeSavedEnvironmentId,
   ]);
   const [reconnectingEnvironmentId, setReconnectingEnvironmentId] = useState<EnvironmentId | null>(
     null,
@@ -1130,7 +1142,7 @@ export default function ChatView(props: ChatViewProps) {
     async (environmentId: EnvironmentId, label: string) => {
       setReconnectingEnvironmentId(environmentId);
       try {
-        await reconnectSavedEnvironment(environmentId);
+        await retryEnvironment(environmentId);
         toastManager.add({
           type: "success",
           title: "Environment reconnected",
@@ -1148,7 +1160,7 @@ export default function ChatView(props: ChatViewProps) {
         setReconnectingEnvironmentId(null);
       }
     },
-    [],
+    [retryEnvironment],
   );
   const projectGroupingSettings = useSettings(selectProjectGroupingSettings);
   const logicalProjectEnvironments = useMemo(() => {
@@ -1168,14 +1180,7 @@ export default function ChatView(props: ChatViewProps) {
       if (seen.has(p.environmentId)) continue;
       seen.add(p.environmentId);
       const isPrimary = p.environmentId === primaryEnvironmentId;
-      const savedRecord = savedEnvironmentRegistry[p.environmentId];
-      const runtimeState = savedEnvironmentRuntimeById[p.environmentId];
-      const label = resolveEnvironmentOptionLabel({
-        isPrimary,
-        environmentId: p.environmentId,
-        runtimeLabel: runtimeState?.descriptor?.label ?? null,
-        savedLabel: savedRecord?.label ?? null,
-      });
+      const label = environmentById.get(p.environmentId)?.label ?? p.environmentId;
       envs.push({
         environmentId: p.environmentId,
         projectId: p.id,
@@ -1189,14 +1194,7 @@ export default function ChatView(props: ChatViewProps) {
       return a.label.localeCompare(b.label);
     });
     return envs;
-  }, [
-    activeProject,
-    allProjects,
-    projectGroupingSettings,
-    primaryEnvironmentId,
-    savedEnvironmentRegistry,
-    savedEnvironmentRuntimeById,
-  ]);
+  }, [activeProject, allProjects, projectGroupingSettings, primaryEnvironmentId, environmentById]);
   const hasMultipleEnvironments = logicalProjectEnvironments.length > 1;
 
   const openPullRequestDialog = useCallback(
@@ -1336,17 +1334,7 @@ export default function ChatView(props: ChatViewProps) {
     selectedProvider: selectedProviderByThreadId,
     threadProvider,
   });
-  const primaryServerConfig = useServerConfig();
-  const activeEnvRuntimeState = useSavedEnvironmentRuntimeStore((s) =>
-    activeThread?.environmentId ? s.byId[activeThread.environmentId] : null,
-  );
-  // Use the server config for the thread's environment.  For the primary
-  // environment fall back to the global atom; for remote environments use
-  // the runtime state stored by the environment manager.
-  const serverConfig =
-    primaryEnvironmentId && activeThread?.environmentId === primaryEnvironmentId
-      ? primaryServerConfig
-      : (activeEnvRuntimeState?.serverConfig ?? primaryServerConfig);
+  const serverConfig = activeEnvironment?.serverConfig ?? primaryEnvironment?.serverConfig ?? null;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -1360,27 +1348,17 @@ export default function ChatView(props: ChatViewProps) {
     isVersionMismatchDismissed(versionMismatchDismissKey);
   const showVersionMismatchBanner =
     versionMismatch !== null && versionMismatchDismissKey !== null && !versionMismatchDismissed;
-  const hasMultipleRegisteredEnvironments = Object.keys(savedEnvironmentRegistry).length > 0;
+  const hasMultipleRegisteredEnvironments = environments.length > 1;
   const versionMismatchServerLabel = useMemo(() => {
     if (!hasMultipleRegisteredEnvironments || !activeThread) {
       return "server";
     }
 
-    const isPrimary = activeThread.environmentId === primaryEnvironmentId;
-    const savedRecord = savedEnvironmentRegistry[activeThread.environmentId];
-    const runtimeState = savedEnvironmentRuntimeById[activeThread.environmentId];
-    return `${resolveEnvironmentOptionLabel({
-      isPrimary,
-      environmentId: activeThread.environmentId,
-      runtimeLabel: runtimeState?.descriptor?.label ?? serverConfig?.environment.label ?? null,
-      savedLabel: savedRecord?.label ?? null,
-    })} server`;
+    return `${environmentById.get(activeThread.environmentId)?.label ?? serverConfig?.environment.label ?? activeThread.environmentId} server`;
   }, [
     activeThread,
+    environmentById,
     hasMultipleRegisteredEnvironments,
-    primaryEnvironmentId,
-    savedEnvironmentRegistry,
-    savedEnvironmentRuntimeById,
     serverConfig?.environment.label,
   ]);
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
@@ -2017,30 +1995,30 @@ export default function ChatView(props: ChatViewProps) {
     if (!cwdForOpen) {
       return;
     }
-    const api = readEnvironmentApi(environmentId);
-    if (!api) {
-      return;
-    }
     const terminalId = nextTerminalId(activeKnownTerminalIds);
     storeSplitTerminal(activeThreadRef, terminalId);
     setTerminalFocusRequestId((value) => value + 1);
     void (async () => {
       try {
-        await api.terminal.open({
-          threadId: activeThreadId,
-          terminalId,
-          cwd: cwdForOpen,
-          ...(activeThreadWorktreePath != null ? { worktreePath: activeThreadWorktreePath } : {}),
-          env: projectScriptRuntimeEnv({
-            project: { cwd: activeProject.cwd },
-            worktreePath: activeThreadWorktreePath,
-          }),
+        await actions.terminal.open({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            terminalId,
+            cwd: cwdForOpen,
+            ...(activeThreadWorktreePath != null ? { worktreePath: activeThreadWorktreePath } : {}),
+            env: projectScriptRuntimeEnv({
+              project: { cwd: activeProject.cwd },
+              worktreePath: activeThreadWorktreePath,
+            }),
+          },
         });
       } catch {
         // Opening failed; the tab is already in the store — user can retry or close it.
       }
     })();
   }, [
+    actions.terminal,
     activeProject,
     activeKnownTerminalIds,
     activeThreadId,
@@ -2059,30 +2037,30 @@ export default function ChatView(props: ChatViewProps) {
     if (!cwdForOpen) {
       return;
     }
-    const api = readEnvironmentApi(environmentId);
-    if (!api) {
-      return;
-    }
     const terminalId = nextTerminalId(activeKnownTerminalIds);
     storeNewTerminal(activeThreadRef, terminalId);
     setTerminalFocusRequestId((value) => value + 1);
     void (async () => {
       try {
-        await api.terminal.open({
-          threadId: activeThreadId,
-          terminalId,
-          cwd: cwdForOpen,
-          ...(activeThreadWorktreePath != null ? { worktreePath: activeThreadWorktreePath } : {}),
-          env: projectScriptRuntimeEnv({
-            project: { cwd: activeProject.cwd },
-            worktreePath: activeThreadWorktreePath,
-          }),
+        await actions.terminal.open({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            terminalId,
+            cwd: cwdForOpen,
+            ...(activeThreadWorktreePath != null ? { worktreePath: activeThreadWorktreePath } : {}),
+            env: projectScriptRuntimeEnv({
+              project: { cwd: activeProject.cwd },
+              worktreePath: activeThreadWorktreePath,
+            }),
+          },
         });
       } catch {
         // Opening failed; the tab is already in the store — user can retry or close it.
       }
     })();
   }, [
+    actions.terminal,
     activeProject,
     activeKnownTerminalIds,
     activeThreadId,
@@ -2094,33 +2072,44 @@ export default function ChatView(props: ChatViewProps) {
   ]);
   const closeTerminal = useCallback(
     (terminalId: string) => {
-      const api = readEnvironmentApi(environmentId);
-      if (!activeThreadId || !api || !activeThreadRef) return;
+      if (!activeThreadId || !activeThreadRef) return;
       const isFinalTerminal = activeKnownTerminalIds.length <= 1;
       const fallbackExitWrite = () =>
-        api.terminal
-          .write({ threadId: activeThreadId, terminalId, data: "exit\n" })
+        actions.terminal
+          .write({
+            environmentId,
+            input: { threadId: activeThreadId, terminalId, data: "exit\n" },
+          })
           .catch(() => undefined);
-      if ("close" in api.terminal && typeof api.terminal.close === "function") {
-        void (async () => {
-          if (isFinalTerminal) {
-            await api.terminal
-              .clear({ threadId: activeThreadId, terminalId })
-              .catch(() => undefined);
-          }
-          await api.terminal.close({
+      void (async () => {
+        if (isFinalTerminal) {
+          await actions.terminal
+            .clear({
+              environmentId,
+              input: { threadId: activeThreadId, terminalId },
+            })
+            .catch(() => undefined);
+        }
+        await actions.terminal.close({
+          environmentId,
+          input: {
             threadId: activeThreadId,
             terminalId,
             deleteHistory: true,
-          });
-        })().catch(() => fallbackExitWrite());
-      } else {
-        void fallbackExitWrite();
-      }
+          },
+        });
+      })().catch(() => fallbackExitWrite());
       storeCloseTerminal(activeThreadRef, terminalId);
       setTerminalFocusRequestId((value) => value + 1);
     },
-    [activeThreadId, activeThreadRef, activeKnownTerminalIds, environmentId, storeCloseTerminal],
+    [
+      actions.terminal,
+      activeThreadId,
+      activeThreadRef,
+      activeKnownTerminalIds,
+      environmentId,
+      storeCloseTerminal,
+    ],
   );
   const runProjectScript = useCallback(
     async (
@@ -2133,8 +2122,7 @@ export default function ChatView(props: ChatViewProps) {
         rememberAsLastInvoked?: boolean;
       },
     ) => {
-      const api = readEnvironmentApi(environmentId);
-      if (!api || !activeThreadId || !activeProject || !activeThread) return;
+      if (!activeThreadId || !activeProject || !activeThread) return;
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
           if (current[activeProject.id] === script.id) return current;
@@ -2195,11 +2183,14 @@ export default function ChatView(props: ChatViewProps) {
       }
 
       try {
-        await api.terminal.open(openTerminalInput);
-        await api.terminal.write({
-          threadId: activeThreadId,
-          terminalId: targetTerminalId,
-          data: `${script.command}\r`,
+        await actions.terminal.open({ environmentId, input: openTerminalInput });
+        await actions.terminal.write({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            terminalId: targetTerminalId,
+            data: `${script.command}\r`,
+          },
         });
       } catch (error) {
         setThreadError(
@@ -2209,6 +2200,7 @@ export default function ChatView(props: ChatViewProps) {
       }
     },
     [
+      actions.terminal,
       activeProject,
       activeThread,
       activeThreadId,
@@ -2235,14 +2227,12 @@ export default function ChatView(props: ChatViewProps) {
       keybinding?: string | null;
       keybindingCommand: KeybindingCommand;
     }) => {
-      const api = readEnvironmentApi(environmentId);
-      if (!api) return;
-
-      await api.orchestration.dispatchCommand({
-        type: "project.meta.update",
-        commandId: newCommandId(),
-        projectId: input.projectId,
-        scripts: input.nextScripts,
+      await actions.projects.update({
+        environmentId,
+        input: {
+          projectId: input.projectId,
+          scripts: input.nextScripts,
+        },
       });
 
       const keybindingRule = decodeProjectScriptKeybindingRule({
@@ -2251,14 +2241,13 @@ export default function ChatView(props: ChatViewProps) {
       });
 
       if (isElectron && keybindingRule) {
-        const localApi = readLocalApi();
-        if (!localApi) {
-          throw new Error("Local API unavailable.");
-        }
-        await localApi.server.upsertKeybinding(keybindingRule);
+        await actions.server.upsertKeybinding({
+          environmentId,
+          input: keybindingRule,
+        });
       }
     },
-    [environmentId],
+    [actions.projects, actions.server, environmentId],
   );
   const saveProjectScript = useCallback(
     async (input: NewProjectScriptInput) => {
@@ -2429,10 +2418,6 @@ export default function ChatView(props: ChatViewProps) {
       if (!serverThread) {
         return;
       }
-      const api = readEnvironmentApi(environmentId);
-      if (!api) {
-        return;
-      }
 
       if (
         input.modelSelection !== undefined &&
@@ -2441,35 +2426,38 @@ export default function ChatView(props: ChatViewProps) {
           JSON.stringify(input.modelSelection.options ?? null) !==
             JSON.stringify(serverThread.modelSelection.options ?? null))
       ) {
-        await api.orchestration.dispatchCommand({
-          type: "thread.meta.update",
-          commandId: newCommandId(),
-          threadId: input.threadId,
-          modelSelection: input.modelSelection,
+        await actions.threads.updateMetadata({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            modelSelection: input.modelSelection,
+          },
         });
       }
 
       if (input.runtimeMode !== serverThread.runtimeMode) {
-        await api.orchestration.dispatchCommand({
-          type: "thread.runtime-mode.set",
-          commandId: newCommandId(),
-          threadId: input.threadId,
-          runtimeMode: input.runtimeMode,
-          createdAt: input.createdAt,
+        await actions.threads.setRuntimeMode({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            runtimeMode: input.runtimeMode,
+            createdAt: input.createdAt,
+          },
         });
       }
 
       if (input.interactionMode !== serverThread.interactionMode) {
-        await api.orchestration.dispatchCommand({
-          type: "thread.interaction-mode.set",
-          commandId: newCommandId(),
-          threadId: input.threadId,
-          interactionMode: input.interactionMode,
-          createdAt: input.createdAt,
+        await actions.threads.setInteractionMode({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            interactionMode: input.interactionMode,
+            createdAt: input.createdAt,
+          },
         });
       }
     },
-    [environmentId, serverThread],
+    [actions.threads, environmentId, serverThread],
   );
 
   // Scroll helpers — LegendList handles auto-scroll via maintainScrollAtEnd.
@@ -2780,9 +2768,8 @@ export default function ChatView(props: ChatViewProps) {
 
   const onRevertToTurnCount = useCallback(
     async (turnCount: number) => {
-      const api = readEnvironmentApi(environmentId);
       const localApi = readLocalApi();
-      if (!api || !localApi || !activeThread || isRevertingCheckpoint) return;
+      if (!localApi || !activeThread || isRevertingCheckpoint) return;
 
       if (activeEnvironmentUnavailable && activeEnvironmentUnavailableLabel) {
         setThreadError(
@@ -2809,12 +2796,12 @@ export default function ChatView(props: ChatViewProps) {
       setIsRevertingCheckpoint(true);
       setThreadError(activeThread.id, null);
       try {
-        await api.orchestration.dispatchCommand({
-          type: "thread.checkpoint.revert",
-          commandId: newCommandId(),
-          threadId: activeThread.id,
-          turnCount,
-          createdAt: new Date().toISOString(),
+        await actions.threads.revertCheckpoint({
+          environmentId,
+          input: {
+            threadId: activeThread.id,
+            turnCount,
+          },
         });
       } catch (err) {
         setThreadError(
@@ -2825,6 +2812,7 @@ export default function ChatView(props: ChatViewProps) {
       setIsRevertingCheckpoint(false);
     },
     [
+      actions.threads,
       activeThread,
       activeEnvironmentUnavailable,
       activeEnvironmentUnavailableLabel,
@@ -2839,9 +2827,7 @@ export default function ChatView(props: ChatViewProps) {
 
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
-    const api = readEnvironmentApi(environmentId);
     if (
-      !api ||
       !activeThread ||
       isSendBusy ||
       isConnecting ||
@@ -3034,11 +3020,12 @@ export default function ChatView(props: ChatViewProps) {
 
       // Auto-title from first message
       if (isFirstMessage && isServerThread) {
-        await api.orchestration.dispatchCommand({
-          type: "thread.meta.update",
-          commandId: newCommandId(),
-          threadId: threadIdForSend,
-          title,
+        await actions.threads.updateMetadata({
+          environmentId,
+          input: {
+            threadId: threadIdForSend,
+            title,
+          },
         });
       }
 
@@ -3083,22 +3070,23 @@ export default function ChatView(props: ChatViewProps) {
             }
           : undefined;
       beginLocalDispatch({ preparingWorktree: false });
-      await api.orchestration.dispatchCommand({
-        type: "thread.turn.start",
-        commandId: newCommandId(),
-        threadId: threadIdForSend,
-        message: {
-          messageId: messageIdForSend,
-          role: "user",
-          text: outgoingMessageText,
-          attachments: turnAttachments,
+      await actions.threads.startTurn({
+        environmentId,
+        input: {
+          threadId: threadIdForSend,
+          message: {
+            messageId: messageIdForSend,
+            role: "user",
+            text: outgoingMessageText,
+            attachments: turnAttachments,
+          },
+          modelSelection: ctxSelectedModelSelection,
+          titleSeed: title,
+          runtimeMode,
+          interactionMode,
+          ...(bootstrap ? { bootstrap } : {}),
+          createdAt: messageCreatedAt,
         },
-        modelSelection: ctxSelectedModelSelection,
-        titleSeed: title,
-        runtimeMode,
-        interactionMode,
-        ...(bootstrap ? { bootstrap } : {}),
-        createdAt: messageCreatedAt,
       });
       turnStartSucceeded = true;
     })().catch(async (err: unknown) => {
@@ -3141,32 +3129,30 @@ export default function ChatView(props: ChatViewProps) {
   };
 
   const onInterrupt = async () => {
-    const api = readEnvironmentApi(environmentId);
-    if (!api || !activeThread) return;
-    await api.orchestration.dispatchCommand({
-      type: "thread.turn.interrupt",
-      commandId: newCommandId(),
-      threadId: activeThread.id,
-      createdAt: new Date().toISOString(),
+    if (!activeThread) return;
+    await actions.threads.interruptTurn({
+      environmentId,
+      input: {
+        threadId: activeThread.id,
+      },
     });
   };
 
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
-      const api = readEnvironmentApi(environmentId);
-      if (!api || !activeThreadId) return;
+      if (!activeThreadId) return;
 
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
       );
-      await api.orchestration
-        .dispatchCommand({
-          type: "thread.approval.respond",
-          commandId: newCommandId(),
-          threadId: activeThreadId,
-          requestId,
-          decision,
-          createdAt: new Date().toISOString(),
+      await actions.threads
+        .respondToApproval({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            requestId,
+            decision,
+          },
         })
         .catch((err: unknown) => {
           setThreadError(
@@ -3176,25 +3162,24 @@ export default function ChatView(props: ChatViewProps) {
         });
       setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
     },
-    [activeThreadId, environmentId, setThreadError],
+    [actions.threads, activeThreadId, environmentId, setThreadError],
   );
 
   const onRespondToUserInput = useCallback(
     async (requestId: ApprovalRequestId, answers: Record<string, unknown>) => {
-      const api = readEnvironmentApi(environmentId);
-      if (!api || !activeThreadId) return;
+      if (!activeThreadId) return;
 
       setRespondingUserInputRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
       );
-      await api.orchestration
-        .dispatchCommand({
-          type: "thread.user-input.respond",
-          commandId: newCommandId(),
-          threadId: activeThreadId,
-          requestId,
-          answers,
-          createdAt: new Date().toISOString(),
+      await actions.threads
+        .respondToUserInput({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            requestId,
+            answers,
+          },
         })
         .catch((err: unknown) => {
           setThreadError(
@@ -3204,7 +3189,7 @@ export default function ChatView(props: ChatViewProps) {
         });
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
     },
-    [activeThreadId, environmentId, setThreadError],
+    [actions.threads, activeThreadId, environmentId, setThreadError],
   );
 
   const setActivePendingUserInputQuestionIndex = useCallback(
@@ -3321,9 +3306,7 @@ export default function ChatView(props: ChatViewProps) {
       text: string;
       interactionMode: "default" | "plan";
     }) => {
-      const api = readEnvironmentApi(environmentId);
       if (
-        !api ||
         !activeThread ||
         !isServerThread ||
         isSendBusy ||
@@ -3398,29 +3381,30 @@ export default function ChatView(props: ChatViewProps) {
           nextInteractionMode,
         );
 
-        await api.orchestration.dispatchCommand({
-          type: "thread.turn.start",
-          commandId: newCommandId(),
-          threadId: threadIdForSend,
-          message: {
-            messageId: messageIdForSend,
-            role: "user",
-            text: outgoingMessageText,
-            attachments: [],
+        await actions.threads.startTurn({
+          environmentId,
+          input: {
+            threadId: threadIdForSend,
+            message: {
+              messageId: messageIdForSend,
+              role: "user",
+              text: outgoingMessageText,
+              attachments: [],
+            },
+            modelSelection: ctxSelectedModelSelection,
+            titleSeed: activeThread.title,
+            runtimeMode,
+            interactionMode: nextInteractionMode,
+            ...(nextInteractionMode === "default" && activeProposedPlan
+              ? {
+                  sourceProposedPlan: {
+                    threadId: activeThread.id,
+                    planId: activeProposedPlan.id,
+                  },
+                }
+              : {}),
+            createdAt: messageCreatedAt,
           },
-          modelSelection: ctxSelectedModelSelection,
-          titleSeed: activeThread.title,
-          runtimeMode,
-          interactionMode: nextInteractionMode,
-          ...(nextInteractionMode === "default" && activeProposedPlan
-            ? {
-                sourceProposedPlan: {
-                  threadId: activeThread.id,
-                  planId: activeProposedPlan.id,
-                },
-              }
-            : {}),
-          createdAt: messageCreatedAt,
         });
         // Optimistically open the plan sidebar when implementing (not refining).
         // "default" mode here means the agent is executing the plan, which produces
@@ -3443,6 +3427,7 @@ export default function ChatView(props: ChatViewProps) {
       }
     },
     [
+      actions.threads,
       activeThread,
       activeProposedPlan,
       beginLocalDispatch,
@@ -3460,9 +3445,7 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const onImplementPlanInNewThread = useCallback(async () => {
-    const api = readEnvironmentApi(environmentId);
     if (
-      !api ||
       !activeThread ||
       !activeProject ||
       !activeProposedPlan ||
@@ -3508,40 +3491,42 @@ export default function ChatView(props: ChatViewProps) {
       resetLocalDispatch();
     };
 
-    await api.orchestration
-      .dispatchCommand({
-        type: "thread.create",
-        commandId: newCommandId(),
-        threadId: nextThreadId,
-        projectId: activeProject.id,
-        title: nextThreadTitle,
-        modelSelection: nextThreadModelSelection,
-        runtimeMode,
-        interactionMode: "default",
-        branch: activeThreadBranch,
-        worktreePath: activeThread.worktreePath,
-        createdAt,
-      })
-      .then(() => {
-        return api.orchestration.dispatchCommand({
-          type: "thread.turn.start",
-          commandId: newCommandId(),
+    await actions.threads
+      .create({
+        environmentId,
+        input: {
           threadId: nextThreadId,
-          message: {
-            messageId: newMessageId(),
-            role: "user",
-            text: outgoingImplementationPrompt,
-            attachments: [],
-          },
-          modelSelection: ctxSelectedModelSelection,
-          titleSeed: nextThreadTitle,
+          projectId: activeProject.id,
+          title: nextThreadTitle,
+          modelSelection: nextThreadModelSelection,
           runtimeMode,
           interactionMode: "default",
-          sourceProposedPlan: {
-            threadId: activeThread.id,
-            planId: activeProposedPlan.id,
-          },
+          branch: activeThreadBranch,
+          worktreePath: activeThread.worktreePath,
           createdAt,
+        },
+      })
+      .then(() => {
+        return actions.threads.startTurn({
+          environmentId,
+          input: {
+            threadId: nextThreadId,
+            message: {
+              messageId: newMessageId(),
+              role: "user",
+              text: outgoingImplementationPrompt,
+              attachments: [],
+            },
+            modelSelection: ctxSelectedModelSelection,
+            titleSeed: nextThreadTitle,
+            runtimeMode,
+            interactionMode: "default",
+            sourceProposedPlan: {
+              threadId: activeThread.id,
+              planId: activeProposedPlan.id,
+            },
+            createdAt,
+          },
         });
       })
       .then(() => {
@@ -3559,11 +3544,12 @@ export default function ChatView(props: ChatViewProps) {
         });
       })
       .catch(async (err: unknown) => {
-        await api.orchestration
-          .dispatchCommand({
-            type: "thread.delete",
-            commandId: newCommandId(),
-            threadId: nextThreadId,
+        await actions.threads
+          .delete({
+            environmentId,
+            input: {
+              threadId: nextThreadId,
+            },
           })
           .catch(() => undefined);
         toastManager.add(
@@ -3579,6 +3565,7 @@ export default function ChatView(props: ChatViewProps) {
       })
       .then(finish, finish);
   }, [
+    actions.threads,
     activeProject,
     activeProposedPlan,
     activeThreadBranch,

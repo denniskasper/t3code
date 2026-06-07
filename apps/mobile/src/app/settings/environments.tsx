@@ -1,14 +1,10 @@
 import { useAuth } from "@clerk/expo";
 import { Stack, useRouter } from "expo-router";
 import { SymbolView } from "expo-symbols";
-import { findErrorTraceId } from "@t3tools/client-runtime";
 import type { EnvironmentId } from "@t3tools/contracts";
-import type { RelayClientEnvironmentRecord } from "@t3tools/contracts/relay";
-import * as Effect from "effect/Effect";
 import { useCallback, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Pressable,
   ScrollView,
   Switch,
@@ -19,29 +15,20 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppText as Text } from "../../components/AppText";
-import { connectCloudEnvironment } from "../../features/cloud/linkEnvironment";
 import {
-  hasCloudPublicConfig,
-  resolveRelayClerkTokenOptions,
-} from "../../features/cloud/publicConfig";
+  type MobileRelayEnvironmentView,
+  useMobileConnectionController,
+} from "../../connection/useMobileConnectionController";
+import { hasCloudPublicConfig } from "../../features/cloud/publicConfig";
 import { availableCloudEnvironmentPresentation } from "../../features/cloud/cloudEnvironmentPresentation";
-import {
-  useManagedRelayEnvironments,
-  useManagedRelayEnvironmentStatus,
-} from "../../features/cloud/managedRelayState";
 import { ConnectionEnvironmentRow } from "../../features/connection/ConnectionEnvironmentRow";
 import { ConnectionStatusDot } from "../../features/connection/ConnectionStatusDot";
 import { splitEnvironmentSections } from "../../features/connection/environmentSections";
 import { cn } from "../../lib/cn";
 import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
-import { mobileRuntime } from "../../lib/runtime";
 import { useThemeColor } from "../../lib/useThemeColor";
 import type { ConnectedEnvironmentSummary } from "../../state/remote-runtime-types";
-import {
-  connectSavedEnvironment,
-  disconnectEnvironment,
-  useRemoteConnections,
-} from "../../state/use-remote-environment-registry";
+import { useRemoteConnections } from "../../state/use-remote-environment-registry";
 
 export default function SettingsEnvironmentsRouteScreen() {
   const {
@@ -129,7 +116,6 @@ export default function SettingsEnvironmentsRouteScreen() {
 
         {hasCloudPublicConfig() ? (
           <ConfiguredCloudEnvironmentRows
-            connectedEnvironments={connectedEnvironments}
             connectedCloudEnvironments={connectedCloudEnvironments}
             onReconnectEnvironment={onReconnectEnvironment}
           />
@@ -140,68 +126,38 @@ export default function SettingsEnvironmentsRouteScreen() {
 }
 
 function ConfiguredCloudEnvironmentRows(props: {
-  readonly connectedEnvironments: ReadonlyArray<ConnectedEnvironmentSummary>;
   readonly connectedCloudEnvironments: ReadonlyArray<ConnectedEnvironmentSummary>;
   readonly onReconnectEnvironment: (environmentId: EnvironmentId) => void;
 }) {
-  const { getToken, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
-  const cloudEnvironmentsState = useManagedRelayEnvironments();
+  const { isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
+  const controller = useMobileConnectionController();
   const [connectingCloudEnvironmentId, setConnectingCloudEnvironmentId] = useState<string | null>(
     null,
   );
   const iconColor = useThemeColor("--color-icon");
-  const { availableCloudEnvironments } = splitEnvironmentSections({
-    connectedEnvironments: props.connectedEnvironments,
-    cloudEnvironments: cloudEnvironmentsState.data,
-  });
+  const availableCloudEnvironments = controller.availableRelayEnvironments;
   const [expandedErrorId, setExpandedErrorId] = useState<string | null>(null);
   const hasCloudRows =
     props.connectedCloudEnvironments.length > 0 || availableCloudEnvironments.length > 0;
 
   const handleConnectCloudEnvironment = useCallback(
-    async (environment: RelayClientEnvironmentRecord) => {
-      setConnectingCloudEnvironmentId(environment.environmentId);
+    async (entry: MobileRelayEnvironmentView) => {
+      setConnectingCloudEnvironmentId(entry.environment.environmentId);
       try {
-        const token = await getToken(resolveRelayClerkTokenOptions());
-        if (!token) {
-          throw new Error("Sign in to T3 Cloud before connecting.");
-        }
-        await mobileRuntime.runPromise(
-          connectCloudEnvironment({
-            clerkToken: token,
-            environment,
-          }).pipe(Effect.flatMap(connectSavedEnvironment)),
-        );
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Could not connect to this environment.";
-        const traceId = findErrorTraceId(error);
-        console.error("[t3-cloud] Connect failed", { message, traceId, error });
-        Alert.alert("Connect failed", appendTraceId(message, traceId), [
-          ...(traceId
-            ? [
-                {
-                  text: "Copy Trace ID",
-                  onPress: () => {
-                    copyTextWithHaptic(traceId);
-                  },
-                },
-              ]
-            : []),
-          { text: "OK" },
-        ]);
+        await controller.connectRelayEnvironment(entry.environment);
       } finally {
         setConnectingCloudEnvironmentId(null);
       }
     },
-    [getToken],
+    [controller],
   );
 
-  const handleDisconnectCloudEnvironment = useCallback((environmentId: EnvironmentId) => {
-    void mobileRuntime
-      .runPromise(disconnectEnvironment(environmentId, { removeSaved: true }))
-      .catch(() => undefined);
-  }, []);
+  const handleDisconnectCloudEnvironment = useCallback(
+    (environmentId: EnvironmentId) => {
+      void controller.removeEnvironment(environmentId);
+    },
+    [controller],
+  );
 
   const handleToggleCloudError = useCallback((environmentId: string) => {
     setExpandedErrorId((current) => (current === environmentId ? null : environmentId));
@@ -215,11 +171,13 @@ function ConfiguredCloudEnvironmentRows(props: {
         <Text className="text-[13px] font-t3-bold uppercase text-foreground-muted">T3 Cloud</Text>
         <Pressable
           accessibilityRole="button"
-          disabled={cloudEnvironmentsState.isPending}
-          onPress={cloudEnvironmentsState.refresh}
+          disabled={controller.relayDiscovery.isRefreshing}
+          onPress={() => {
+            void controller.refreshRelayEnvironments();
+          }}
           className="h-9 w-9 items-center justify-center rounded-full bg-subtle active:opacity-70 disabled:opacity-50"
         >
-          {cloudEnvironmentsState.isPending ? (
+          {controller.relayDiscovery.isRefreshing ? (
             <ActivityIndicator color={iconColor} size="small" />
           ) : (
             <SymbolView name="arrow.clockwise" size={14} tintColor={iconColor} type="monochrome" />
@@ -242,33 +200,33 @@ function ConfiguredCloudEnvironmentRows(props: {
           ))}
           {availableCloudEnvironments.map((environment, index) => (
             <CloudEnvironmentRow
-              key={environment.environmentId}
+              key={environment.environment.environmentId}
               environment={environment}
               borderTop={props.connectedCloudEnvironments.length > 0 || index !== 0}
-              isConnecting={connectingCloudEnvironmentId === environment.environmentId}
+              isConnecting={connectingCloudEnvironmentId === environment.environment.environmentId}
               onConnect={() => handleConnectCloudEnvironment(environment)}
-              errorExpanded={expandedErrorId === environment.environmentId}
-              onToggleError={() => handleToggleCloudError(environment.environmentId)}
+              errorExpanded={expandedErrorId === environment.environment.environmentId}
+              onToggleError={() => handleToggleCloudError(environment.environment.environmentId)}
             />
           ))}
         </View>
-      ) : cloudEnvironmentsState.data === null ? (
+      ) : controller.relayDiscovery.isRefreshing ? (
         <View collapsable={false} className="items-center gap-3 rounded-[24px] bg-card p-6">
           <ActivityIndicator color={iconColor} />
           <Text className="text-center text-[14px] leading-[20px] text-foreground-muted">
             Loading linked cloud environments.
           </Text>
         </View>
-      ) : cloudEnvironmentsState.error ? (
+      ) : controller.relayDiscovery.error ? (
         <View collapsable={false} className="gap-3 rounded-[24px] bg-card p-5">
           <Text className="text-[15px] font-t3-bold text-foreground">
             Could not load T3 Cloud environments
           </Text>
           <Text className="text-[13px] leading-[18px] text-foreground-muted">
-            {cloudEnvironmentsState.error}
+            {controller.relayDiscovery.error}
           </Text>
-          {cloudEnvironmentsState.errorTraceId ? (
-            <CopyTraceIdButton traceId={cloudEnvironmentsState.errorTraceId} />
+          {controller.relayDiscovery.errorTraceId ? (
+            <CopyTraceIdButton traceId={controller.relayDiscovery.errorTraceId} />
           ) : null}
         </View>
       ) : (
@@ -322,21 +280,20 @@ function ConnectedCloudEnvironmentRow(props: {
 }
 
 function CloudEnvironmentRow(props: {
-  readonly environment: RelayClientEnvironmentRecord;
+  readonly environment: MobileRelayEnvironmentView;
   readonly borderTop: boolean;
   readonly errorExpanded: boolean;
   readonly isConnecting: boolean;
   readonly onConnect: () => void;
   readonly onToggleError: () => void;
 }) {
-  const statusState = useManagedRelayEnvironmentStatus(props.environment);
   const disabled = props.isConnecting;
   const presentation = availableCloudEnvironmentPresentation({
     isConnecting: props.isConnecting,
-    isStatusPending: statusState.isPending,
-    status: statusState.data,
-    statusError: statusState.error,
-    statusErrorTraceId: statusState.errorTraceId,
+    isStatusPending: props.environment.availability === "checking",
+    status: props.environment.status,
+    statusError: props.environment.error,
+    statusErrorTraceId: props.environment.traceId,
   });
 
   return (
@@ -347,7 +304,7 @@ function CloudEnvironmentRow(props: {
       connectionState={presentation.connectionState}
       disabled={disabled}
       errorExpanded={props.errorExpanded}
-      label={props.environment.label}
+      label={props.environment.environment.label}
       onValueChange={(enabled) => {
         if (enabled) {
           props.onConnect();
@@ -494,10 +451,6 @@ function CloudEnvironmentRowShell(props: {
       />
     </View>
   );
-}
-
-function appendTraceId(message: string, traceId: string | null): string {
-  return traceId ? `${message}\n\nTrace ID: ${traceId}` : message;
 }
 
 function CopyTraceIdButton(props: { readonly traceId: string }) {

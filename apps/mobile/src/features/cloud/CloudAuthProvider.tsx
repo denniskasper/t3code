@@ -1,6 +1,11 @@
 import { ClerkProvider, useAuth } from "@clerk/expo";
 import { tokenCache } from "@clerk/expo/token-cache";
-import { createManagedRelaySession, setManagedRelaySession } from "@t3tools/client-runtime";
+import {
+  createManagedRelaySession,
+  ManagedRelayClient,
+  setManagedRelaySession,
+} from "@t3tools/client-runtime";
+import * as Effect from "effect/Effect";
 import { type ReactNode, useEffect, useRef } from "react";
 
 import { mobileRuntime } from "../../lib/runtime";
@@ -11,6 +16,12 @@ import {
 } from "../agent-awareness/remoteRegistration";
 import { resolveCloudPublicConfig, resolveRelayClerkTokenOptions } from "./publicConfig";
 
+function resetManagedRelayTokenCache(): Promise<void> {
+  return mobileRuntime.runPromise(
+    ManagedRelayClient.pipe(Effect.flatMap((client) => client.resetTokenCache)),
+  );
+}
+
 function CloudAuthBridge(props: { readonly children: ReactNode }) {
   const { getToken, isLoaded, isSignedIn, userId } = useAuth({ treatPendingAsSignedOut: false });
   const previousTokenProviderRef = useRef<{
@@ -19,6 +30,7 @@ function CloudAuthBridge(props: { readonly children: ReactNode }) {
   } | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     if (!isLoaded) {
       return;
     }
@@ -29,6 +41,7 @@ function CloudAuthBridge(props: { readonly children: ReactNode }) {
         void mobileRuntime
           .runPromise(unregisterAgentAwarenessDeviceForCurrentUser(previous.provider))
           .catch(() => undefined);
+        void resetManagedRelayTokenCache();
       }
       setAgentAwarenessRelayTokenProvider(null);
       setManagedRelaySession(appAtomRegistry, null);
@@ -36,21 +49,36 @@ function CloudAuthBridge(props: { readonly children: ReactNode }) {
     }
 
     const previous = previousTokenProviderRef.current;
+    const tokenProvider = () => getToken(resolveRelayClerkTokenOptions());
+    const activateSession = () => {
+      if (cancelled) {
+        return;
+      }
+      previousTokenProviderRef.current = { userId, provider: tokenProvider };
+      setAgentAwarenessRelayTokenProvider(tokenProvider, userId);
+      setManagedRelaySession(
+        appAtomRegistry,
+        createManagedRelaySession({
+          accountId: userId,
+          readClerkToken: tokenProvider,
+        }),
+      );
+    };
     if (previous && previous.userId !== userId) {
+      previousTokenProviderRef.current = null;
+      setAgentAwarenessRelayTokenProvider(null);
+      setManagedRelaySession(appAtomRegistry, null);
       void mobileRuntime
         .runPromise(unregisterAgentAwarenessDeviceForCurrentUser(previous.provider))
         .catch(() => undefined);
+      void resetManagedRelayTokenCache().then(activateSession);
+    } else {
+      activateSession();
     }
-    const tokenProvider = () => getToken(resolveRelayClerkTokenOptions());
-    previousTokenProviderRef.current = { userId, provider: tokenProvider };
-    setAgentAwarenessRelayTokenProvider(tokenProvider, userId);
-    setManagedRelaySession(
-      appAtomRegistry,
-      createManagedRelaySession({
-        accountId: userId,
-        readClerkToken: tokenProvider,
-      }),
-    );
+
+    return () => {
+      cancelled = true;
+    };
   }, [getToken, isLoaded, isSignedIn, userId]);
 
   useEffect(

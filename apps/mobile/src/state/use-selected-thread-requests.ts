@@ -1,9 +1,10 @@
 import { useAtomValue } from "@effect/atom-react";
 import { useCallback, useMemo, useState } from "react";
 
-import { ApprovalRequestId, CommandId, type ProviderApprovalDecision } from "@t3tools/contracts";
+import { ApprovalRequestId, type ProviderApprovalDecision } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 
+import { useMobileActions } from "../connection/useMobileEnvironmentData";
 import { scopedRequestKey } from "../lib/scopedEntities";
 import {
   buildPendingUserInputAnswers,
@@ -12,9 +13,7 @@ import {
   setPendingUserInputCustomAnswer,
   type PendingUserInputDraftAnswer,
 } from "../lib/threadActivity";
-import { uuidv4 } from "../lib/uuid";
 import { appAtomRegistry } from "./atom-registry";
-import { getEnvironmentClient } from "./environment-session-registry";
 import { useSelectedThreadDetail } from "./use-thread-detail";
 import { useThreadSelection } from "./use-thread-selection";
 
@@ -54,6 +53,7 @@ function setUserInputDraftCustomAnswer(
 }
 
 export function useSelectedThreadRequests() {
+  const actions = useMobileActions();
   const { selectedThread: selectedThreadShell } = useThreadSelection();
   const selectedThread = useSelectedThreadDetail();
   const userInputDraftsByRequestKey = useAtomValue(userInputDraftsByRequestKeyAtom);
@@ -112,26 +112,21 @@ export function useSelectedThreadRequests() {
         return;
       }
 
-      const client = getEnvironmentClient(selectedThreadShell.environmentId);
-      if (!client) {
-        return;
-      }
-
       setRespondingApprovalId(requestId);
       try {
-        await client.orchestration.dispatchCommand({
-          type: "thread.approval.respond",
-          commandId: CommandId.make(uuidv4()),
-          threadId: selectedThreadShell.id,
-          requestId,
-          decision,
-          createdAt: new Date().toISOString(),
+        await actions.threads.respondToApproval({
+          environmentId: selectedThreadShell.environmentId,
+          input: {
+            threadId: selectedThreadShell.id,
+            requestId,
+            decision,
+          },
         });
       } finally {
         setRespondingApprovalId((current) => (current === requestId ? null : current));
       }
     },
-    [selectedThreadShell],
+    [actions.threads, selectedThreadShell],
   );
 
   const onSubmitUserInput = useCallback(async () => {
@@ -139,27 +134,22 @@ export function useSelectedThreadRequests() {
       return;
     }
 
-    const client = getEnvironmentClient(selectedThreadShell.environmentId);
-    if (!client) {
-      return;
-    }
-
     setRespondingUserInputId(activePendingUserInput.requestId);
     try {
-      await client.orchestration.dispatchCommand({
-        type: "thread.user-input.respond",
-        commandId: CommandId.make(uuidv4()),
-        threadId: selectedThreadShell.id,
-        requestId: activePendingUserInput.requestId,
-        answers: activePendingUserInputAnswers,
-        createdAt: new Date().toISOString(),
+      await actions.threads.respondToUserInput({
+        environmentId: selectedThreadShell.environmentId,
+        input: {
+          threadId: selectedThreadShell.id,
+          requestId: activePendingUserInput.requestId,
+          answers: activePendingUserInputAnswers,
+        },
       });
     } finally {
       setRespondingUserInputId((current) =>
         current === activePendingUserInput.requestId ? null : current,
       );
     }
-  }, [activePendingUserInput, activePendingUserInputAnswers, selectedThreadShell]);
+  }, [actions.threads, activePendingUserInput, activePendingUserInputAnswers, selectedThreadShell]);
 
   return {
     activePendingApproval,

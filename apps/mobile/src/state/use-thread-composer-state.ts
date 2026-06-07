@@ -6,6 +6,7 @@ import { CommandId, MessageId, type EnvironmentId, type ThreadId } from "@t3tool
 import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
 import { Atom } from "effect/unstable/reactivity";
 
+import { useMobileActions } from "../connection/useMobileEnvironmentData";
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
 import {
   convertPastedImagesToAttachments,
@@ -26,7 +27,6 @@ import {
   setComposerDraftText,
   useComposerDraft,
 } from "./use-composer-drafts";
-import { getEnvironmentClient } from "./environment-session-registry";
 import type { ConnectedEnvironmentSummary } from "../state/remote-runtime-types";
 import {
   setPendingConnectionError,
@@ -175,6 +175,7 @@ function useQueueDrain(input: {
 }
 
 export function useThreadComposerState() {
+  const actions = useMobileActions();
   const { connectedEnvironments } = useRemoteConnectionStatus();
   const { threads } = useRemoteCatalog();
   const { selectedThread: selectedThreadShell } = useThreadSelection();
@@ -238,31 +239,32 @@ export function useThreadComposerState() {
 
   const sendQueuedMessage = useCallback(
     async (queuedMessage: QueuedThreadMessage) => {
-      const client = getEnvironmentClient(queuedMessage.environmentId);
       const thread = threads.find(
         (candidate) =>
           candidate.environmentId === queuedMessage.environmentId &&
           candidate.id === queuedMessage.threadId,
       );
-      if (!client || !thread) {
+      if (!thread) {
         return;
       }
 
       beginDispatchingQueuedMessage(queuedMessage.messageId);
       try {
-        await client.orchestration.dispatchCommand({
-          type: "thread.turn.start",
-          commandId: queuedMessage.commandId,
-          threadId: queuedMessage.threadId,
-          message: {
-            messageId: queuedMessage.messageId,
-            role: "user",
-            text: queuedMessage.text,
-            attachments: queuedMessage.attachments,
+        await actions.threads.startTurn({
+          environmentId: queuedMessage.environmentId,
+          input: {
+            commandId: queuedMessage.commandId,
+            threadId: queuedMessage.threadId,
+            message: {
+              messageId: queuedMessage.messageId,
+              role: "user",
+              text: queuedMessage.text,
+              attachments: queuedMessage.attachments,
+            },
+            runtimeMode: thread.runtimeMode,
+            interactionMode: thread.interactionMode,
+            createdAt: queuedMessage.createdAt,
           },
-          runtimeMode: thread.runtimeMode,
-          interactionMode: thread.interactionMode,
-          createdAt: queuedMessage.createdAt,
         });
 
         removeQueuedMessage(
@@ -283,7 +285,7 @@ export function useThreadComposerState() {
         finishDispatchingQueuedMessage(queuedMessage.messageId);
       }
     },
-    [threads],
+    [actions.threads, threads],
   );
 
   useQueueDrain({

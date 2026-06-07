@@ -34,7 +34,6 @@ import {
   type ThreadTurnState,
   type TurnDiffSummary,
 } from "./types";
-import { resolveEnvironmentHttpUrl } from "./environments/runtime";
 import { sanitizeThreadErrorMessage } from "./rpc/transportError";
 import { getThreadFromEnvironmentState } from "./threadDerivation";
 const isProviderDriverKindValue = Schema.is(ProviderDriverKind);
@@ -166,17 +165,21 @@ function mapSession(session: OrchestrationSession): ThreadSession {
   };
 }
 
-function mapMessage(environmentId: EnvironmentId, message: OrchestrationMessage): ChatMessage {
+function mapMessage(
+  environmentId: EnvironmentId,
+  message: OrchestrationMessage,
+  httpBaseUrl?: string | null,
+): ChatMessage {
   const attachments = message.attachments?.map((attachment) => ({
     type: "image" as const,
     id: attachment.id,
     name: attachment.name,
     mimeType: attachment.mimeType,
     sizeBytes: attachment.sizeBytes,
-    previewUrl: resolveEnvironmentHttpUrl({
-      environmentId,
-      pathname: attachmentPreviewRoutePath(attachment.id),
-    }),
+    previewUrl:
+      httpBaseUrl === undefined || httpBaseUrl === null
+        ? attachmentPreviewRoutePath(attachment.id)
+        : new URL(attachmentPreviewRoutePath(attachment.id), httpBaseUrl).toString(),
   }));
 
   return {
@@ -236,7 +239,11 @@ function mapProject(
   };
 }
 
-function mapThread(thread: OrchestrationThread, environmentId: EnvironmentId): Thread {
+function mapThread(
+  thread: OrchestrationThread,
+  environmentId: EnvironmentId,
+  httpBaseUrl?: string | null,
+): Thread {
   return {
     id: thread.id,
     environmentId,
@@ -247,7 +254,7 @@ function mapThread(thread: OrchestrationThread, environmentId: EnvironmentId): T
     runtimeMode: thread.runtimeMode,
     interactionMode: thread.interactionMode,
     session: thread.session ? mapSession(thread.session) : null,
-    messages: thread.messages.map((message) => mapMessage(environmentId, message)),
+    messages: thread.messages.map((message) => mapMessage(environmentId, message, httpBaseUrl)),
     proposedPlans: thread.proposedPlans.map(mapProposedPlan),
     error: sanitizeThreadErrorMessage(thread.session?.lastError),
     createdAt: thread.createdAt,
@@ -1144,6 +1151,7 @@ export function syncServerThreadDetail(
   state: AppState,
   thread: OrchestrationThread,
   environmentId: EnvironmentId,
+  httpBaseUrl?: string | null,
 ): AppState {
   // TODO(CLIENT-RUNTIME MIGRATION - DO NOT EXPAND THIS WEB-ONLY COPY):
   // Keep web-specific projection here only until the store can consume
@@ -1153,7 +1161,11 @@ export function syncServerThreadDetail(
   return commitEnvironmentState(
     state,
     environmentId,
-    writeThreadState(environmentState, mapThread(thread, environmentId), previousThread),
+    writeThreadState(
+      environmentState,
+      mapThread(thread, environmentId, httpBaseUrl),
+      previousThread,
+    ),
   );
 }
 
@@ -1962,7 +1974,11 @@ interface AppStore extends AppState {
     snapshot: OrchestrationShellSnapshot,
     environmentId: EnvironmentId,
   ) => void;
-  syncServerThreadDetail: (thread: OrchestrationThread, environmentId: EnvironmentId) => void;
+  syncServerThreadDetail: (
+    thread: OrchestrationThread,
+    environmentId: EnvironmentId,
+    httpBaseUrl?: string | null,
+  ) => void;
   applyOrchestrationEvent: (event: OrchestrationEvent, environmentId: EnvironmentId) => void;
   applyOrchestrationEvents: (
     events: ReadonlyArray<OrchestrationEvent>,
@@ -1985,8 +2001,8 @@ export const useStore = create<AppStore>((set) => ({
     set((state) => removeEnvironmentState(state, environmentId)),
   syncServerShellSnapshot: (snapshot, environmentId) =>
     set((state) => syncServerShellSnapshot(state, snapshot, environmentId)),
-  syncServerThreadDetail: (thread, environmentId) =>
-    set((state) => syncServerThreadDetail(state, thread, environmentId)),
+  syncServerThreadDetail: (thread, environmentId, httpBaseUrl) =>
+    set((state) => syncServerThreadDetail(state, thread, environmentId, httpBaseUrl)),
   applyOrchestrationEvent: (event, environmentId) =>
     set((state) => applyOrchestrationEvent(state, event, environmentId)),
   applyOrchestrationEvents: (events, environmentId) =>

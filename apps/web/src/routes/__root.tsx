@@ -8,7 +8,7 @@ import {
   useNavigate,
 } from "@tanstack/react-router";
 import { useEffect, useEffectEvent, useRef } from "react";
-import { QueryClient, useQueryClient } from "@tanstack/react-query";
+import { QueryClient } from "@tanstack/react-query";
 
 import { APP_DISPLAY_NAME } from "../branding";
 import { AppSidebarLayout } from "../components/AppSidebarLayout";
@@ -16,11 +16,6 @@ import { CommandPalette } from "../components/CommandPalette";
 import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
-import {
-  SlowRpcAckToastCoordinator,
-  WebSocketConnectionCoordinator,
-  WebSocketConnectionSurface,
-} from "../components/WebSocketConnectionSurface";
 import { Button } from "../components/ui/button";
 import {
   AnchoredToastProvider,
@@ -29,7 +24,6 @@ import {
   toastManager,
 } from "../components/ui/toast";
 import { resolveAndPersistPreferredEditor } from "../editorPreferences";
-import { readLocalApi } from "../localApi";
 import { useSettings } from "../hooks/useSettings";
 import {
   deriveLogicalProjectKeyFromSettings,
@@ -39,7 +33,6 @@ import {
 import {
   getServerConfigUpdatedNotification,
   ServerConfigUpdatedNotification,
-  startServerStateSync,
   useServerConfig,
   useServerConfigUpdatedSubscription,
   useServerWelcomeSubscription,
@@ -47,22 +40,12 @@ import {
 import { useStore } from "../store";
 import { useUiStateStore } from "../uiStateStore";
 import { syncBrowserChromeTheme } from "../hooks/useTheme";
-import {
-  ensureEnvironmentConnectionBootstrapped,
-  getPrimaryEnvironmentConnection,
-  listSavedEnvironmentRecords,
-  waitForSavedEnvironmentRegistryHydration,
-  startEnvironmentConnectionService,
-  useSavedEnvironmentRegistryStore,
-} from "../environments/runtime";
 import { configureClientTracing } from "../observability/clientTracing";
-import {
-  ensurePrimaryEnvironmentReady,
-  getPrimaryKnownEnvironment,
-  resolveInitialServerAuthGateState,
-  updatePrimaryEnvironmentDescriptor,
-} from "../environments/primary";
+import { resolveInitialServerAuthGateState } from "../environments/primary";
 import { hasHostedPairingRequest, isHostedStaticApp } from "../hostedPairing";
+import { WebConnectionProjections } from "../connection/WebEnvironmentProjection";
+import { useWebActions } from "../connection/useWebEnvironmentData";
+import { useWebEnvironments, useWebPrimaryEnvironment } from "../connection/useWebEnvironments";
 
 export const Route = createRootRouteWithContext<{
   queryClient: QueryClient;
@@ -77,7 +60,6 @@ export const Route = createRootRouteWithContext<{
     }
 
     if (isHostedStaticApp(new URL(window.location.href))) {
-      await waitForSavedEnvironmentRegistryHydration();
       return {
         authGateState: {
           status: "hosted-static",
@@ -85,10 +67,7 @@ export const Route = createRootRouteWithContext<{
       };
     }
 
-    const [, authGateState] = await Promise.all([
-      ensurePrimaryEnvironmentReady(),
-      resolveInitialServerAuthGateState(),
-    ]);
+    const authGateState = await resolveInitialServerAuthGateState();
     return {
       authGateState,
     };
@@ -134,32 +113,27 @@ function RootRouteView() {
     <ToastProvider>
       <AnchoredToastProvider>
         {primaryEnvironmentAuthenticated ? <AuthenticatedTracingBootstrap /> : null}
-        {primaryEnvironmentAuthenticated ? <ServerStateBootstrap /> : null}
-        <EnvironmentConnectionManagerBootstrap />
+        <WebConnectionProjections />
         <RelayClientInstallDialog />
         <SshPasswordPromptDialog />
         <HostedStaticEnvironmentBootstrap />
         {primaryEnvironmentAuthenticated ? <EventRouter /> : null}
         {primaryEnvironmentAuthenticated ? <ProviderUpdateLaunchNotification /> : null}
-        {primaryEnvironmentAuthenticated ? <WebSocketConnectionCoordinator /> : null}
-        {primaryEnvironmentAuthenticated ? <SlowRpcAckToastCoordinator /> : null}
-        {primaryEnvironmentAuthenticated ? (
-          <WebSocketConnectionSurface>{appShell}</WebSocketConnectionSurface>
-        ) : (
-          appShell
-        )}
+        {appShell}
       </AnchoredToastProvider>
     </ToastProvider>
   );
 }
 
 function HostedStaticEnvironmentBootstrap() {
-  const savedEnvironmentCount = useSavedEnvironmentRegistryStore(
-    (state) => Object.keys(state.byId).length,
-  );
+  const { environments } = useWebEnvironments();
 
   useEffect(() => {
-    if (getPrimaryKnownEnvironment()) {
+    if (
+      environments.some(
+        (environment) => environment.entry.target._tag === "PrimaryConnectionTarget",
+      )
+    ) {
       return;
     }
 
@@ -168,13 +142,13 @@ function HostedStaticEnvironmentBootstrap() {
       return;
     }
 
-    const firstSavedEnvironment = listSavedEnvironmentRecords()[0];
+    const firstSavedEnvironment = environments[0];
     if (!firstSavedEnvironment) {
       return;
     }
 
     useStore.getState().setActiveEnvironmentId(firstSavedEnvironment.environmentId);
-  }, [savedEnvironmentCount]);
+  }, [environments]);
 
   return null;
 }
@@ -250,32 +224,10 @@ function errorDetails(error: unknown): string {
   }
 }
 
-function ServerStateBootstrap() {
-  useEffect(() => {
-    if (!getPrimaryKnownEnvironment()) {
-      return;
-    }
-
-    return startServerStateSync(getPrimaryEnvironmentConnection().client.server);
-  }, []);
-
-  return null;
-}
-
 function AuthenticatedTracingBootstrap() {
   useEffect(() => {
     void configureClientTracing();
   }, []);
-
-  return null;
-}
-
-function EnvironmentConnectionManagerBootstrap() {
-  const queryClient = useQueryClient();
-
-  useEffect(() => {
-    return startEnvironmentConnectionService(queryClient);
-  }, [queryClient]);
 
   return null;
 }
@@ -285,24 +237,19 @@ function EventRouter() {
   const navigate = useNavigate();
   const pathname = useLocation({ select: (loc) => loc.pathname });
   const projectGroupingSettings = useSettings(selectProjectGroupingSettings);
+  const primaryEnvironment = useWebPrimaryEnvironment();
+  const actions = useWebActions();
   const readPathname = useEffectEvent(() => pathname);
   const handledBootstrapThreadIdRef = useRef<string | null>(null);
   const seenServerConfigUpdateIdRef = useRef(getServerConfigUpdatedNotification()?.id ?? 0);
   const lastKeybindingsSuccessToastAtRef = useRef(0);
-  const disposedRef = useRef(false);
   const serverConfig = useServerConfig();
 
   const handleWelcome = useEffectEvent((payload: ServerLifecycleWelcomePayload | null) => {
     if (!payload) return;
 
-    updatePrimaryEnvironmentDescriptor(payload.environment);
     setActiveEnvironmentId(payload.environment.environmentId);
     void (async () => {
-      await ensureEnvironmentConnectionBootstrapped(payload.environment.environmentId);
-      if (disposedRef.current) {
-        return;
-      }
-
       if (!payload.bootstrapProjectId || !payload.bootstrapThreadId) {
         return;
       }
@@ -377,18 +324,21 @@ function EventRouter() {
           actionProps: {
             children: "Open keybindings.json",
             onClick: () => {
-              const api = readLocalApi();
-              if (!api) {
+              if (!serverConfig || !primaryEnvironment) {
                 return;
               }
 
-              void Promise.resolve(serverConfig ?? api.server.getConfig())
-                .then((config) => {
-                  const editor = resolveAndPersistPreferredEditor(config.availableEditors);
-                  if (!editor) {
-                    throw new Error("No available editors found.");
-                  }
-                  return api.shell.openInEditor(config.keybindingsConfigPath, editor);
+              const editor = resolveAndPersistPreferredEditor(serverConfig.availableEditors);
+              if (!editor) {
+                return;
+              }
+              void actions.shell
+                .openInEditor({
+                  environmentId: primaryEnvironment.environmentId,
+                  input: {
+                    cwd: serverConfig.keybindingsConfigPath,
+                    editor,
+                  },
                 })
                 .catch((error) => {
                   toastManager.add(
@@ -412,16 +362,8 @@ function EventRouter() {
       return;
     }
 
-    updatePrimaryEnvironmentDescriptor(serverConfig.environment);
     setActiveEnvironmentId(serverConfig.environment.environmentId);
   }, [serverConfig, setActiveEnvironmentId]);
-
-  useEffect(() => {
-    disposedRef.current = false;
-    return () => {
-      disposedRef.current = true;
-    };
-  }, []);
 
   useServerWelcomeSubscription(handleWelcome);
   useServerConfigUpdatedSubscription(handleServerConfigUpdated);

@@ -10,6 +10,11 @@ import {
 } from "./methods/cloudAuth.ts";
 import { getClientSettings, setClientSettings } from "./methods/clientSettings.ts";
 import {
+  clearConnectionCatalog,
+  getConnectionCatalog,
+  setConnectionCatalog,
+} from "./methods/connectionCatalog.ts";
+import {
   getSavedEnvironmentRegistry,
   getSavedEnvironmentSecret,
   removeSavedEnvironmentSecret,
@@ -62,6 +67,9 @@ export const installDesktopIpcHandlers = Effect.gen(function* () {
   yield* ipc.handle(getSavedEnvironmentSecret);
   yield* ipc.handle(setSavedEnvironmentSecret);
   yield* ipc.handle(removeSavedEnvironmentSecret);
+  yield* ipc.handle(getConnectionCatalog);
+  yield* ipc.handle(setConnectionCatalog);
+  yield* ipc.handle(clearConnectionCatalog);
 
   yield* ipc.handle(discoverSshHosts);
   yield* ipc.handle(ensureSshEnvironment);

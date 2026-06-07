@@ -1,7 +1,7 @@
 import type { EnvironmentId } from "@t3tools/contracts";
 import { FolderIcon } from "lucide-react";
 import { useState } from "react";
-import { resolveEnvironmentHttpUrl } from "../environments/runtime";
+import { useWebEnvironments } from "../connection/useWebEnvironments";
 
 const loadedProjectFaviconSrcs = new Set<string>();
 
@@ -10,13 +10,32 @@ export function ProjectFavicon(input: {
   cwd: string;
   className?: string;
 }) {
+  const { presentationById } = useWebEnvironments();
   const src = (() => {
     try {
-      return resolveEnvironmentHttpUrl({
-        environmentId: input.environmentId,
-        pathname: "/api/project-favicon",
-        searchParams: { cwd: input.cwd },
-      });
+      const baseUrl = presentationById.get(input.environmentId)
+        ? (() => {
+            const entry = presentationById.get(input.environmentId)!.entry;
+            switch (entry.target._tag) {
+              case "PrimaryConnectionTarget":
+                return entry.target.httpBaseUrl;
+              case "BearerConnectionTarget":
+                return entry.profile._tag === "Some" &&
+                  entry.profile.value._tag === "BearerConnectionProfile"
+                  ? entry.profile.value.httpBaseUrl
+                  : null;
+              case "RelayConnectionTarget":
+              case "SshConnectionTarget":
+                return null;
+            }
+          })()
+        : null;
+      if (baseUrl === null) {
+        return null;
+      }
+      const url = new URL("/api/project-favicon", baseUrl);
+      url.searchParams.set("cwd", input.cwd);
+      return url.toString();
     } catch {
       return null;
     }

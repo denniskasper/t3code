@@ -64,11 +64,18 @@ const authAccessHarness = vi.hoisted(() => {
     clientSessions: [],
   };
   let revision = 1;
-  const listeners = new Set<(event: AuthAccessStreamEvent) => void>();
+  let currentEvent: AuthAccessStreamEvent = {
+    version: 1,
+    revision,
+    type: "snapshot",
+    payload: snapshot,
+  };
+  const listeners = new Set<() => void>();
 
   const emitEvent = (event: AuthAccessStreamEvent) => {
+    currentEvent = event;
     for (const listener of listeners) {
-      listener(event);
+      listener();
     }
   };
 
@@ -79,10 +86,22 @@ const authAccessHarness = vi.hoisted(() => {
         clientSessions: [],
       };
       revision = 1;
+      currentEvent = {
+        version: 1,
+        revision,
+        type: "snapshot",
+        payload: snapshot,
+      };
       listeners.clear();
     },
     setSnapshot(next: Snapshot) {
       snapshot = next;
+      currentEvent = {
+        version: 1,
+        revision,
+        type: "snapshot",
+        payload: snapshot,
+      };
     },
     emitSnapshot() {
       emitEvent({
@@ -132,14 +151,11 @@ const authAccessHarness = vi.hoisted(() => {
       });
       revision += 1;
     },
-    subscribe(listener: (event: AuthAccessStreamEvent) => void) {
+    getSnapshot() {
+      return currentEvent;
+    },
+    subscribe(listener: () => void) {
       listeners.add(listener);
-      listener({
-        version: 1,
-        revision: 1,
-        type: "snapshot",
-        payload: snapshot,
-      });
       return () => {
         listeners.delete(listener);
       };
@@ -149,6 +165,23 @@ const authAccessHarness = vi.hoisted(() => {
 
 const mockConnectDesktopSshEnvironment = vi.hoisted(() => vi.fn());
 const mockGetClerkToken = vi.hoisted(() => vi.fn(async () => null));
+const mockConnectPairingEnvironment = vi.hoisted(() => vi.fn());
+const mockConnectRelayEnvironment = vi.hoisted(() => vi.fn());
+const mockRemoveEnvironment = vi.hoisted(() => vi.fn());
+const mockRetryEnvironment = vi.hoisted(() => vi.fn());
+const mockRefreshRelayEnvironments = vi.hoisted(() => vi.fn(async () => undefined));
+const mockRefreshProviders = vi.hoisted(() =>
+  vi.fn(async ({ input }: { readonly input: Record<string, never> }) => {
+    return window.nativeApi?.server.refreshProviders(input);
+  }),
+);
+const mockUpdateProvider = vi.hoisted(() =>
+  vi.fn(
+    async ({ input }: { readonly input: Parameters<LocalApi["server"]["updateProvider"]>[0] }) => {
+      return window.nativeApi?.server.updateProvider(input);
+    },
+  ),
+);
 
 vi.mock("@clerk/react", () => ({
   useAuth: () => ({
@@ -157,61 +190,352 @@ vi.mock("@clerk/react", () => ({
   }),
 }));
 
-vi.mock("../../environments/runtime", () => {
-  const primaryConnection = {
-    kind: "primary" as const,
-    knownEnvironment: {
-      id: "environment-local",
-      label: "Local environment",
-      source: "manual" as const,
-      environmentId: EnvironmentId.make("environment-local"),
-      target: {
-        httpBaseUrl: "http://localhost:3000",
-        wsBaseUrl: "ws://localhost:3000",
+vi.mock("../../connection/webConnectionRuntime", async () => {
+  const Effect = await import("effect/Effect");
+  const { Atom } = await import("effect/unstable/reactivity");
+
+  return {
+    linkWebPrimaryEnvironment: Atom.fn(() => Effect.void),
+    unlinkWebPrimaryEnvironment: Atom.fn(() => Effect.void),
+    webEnvironmentData: {
+      queries: {
+        vcsListRefsAtom: vi.fn(),
       },
     },
-    environmentId: EnvironmentId.make("environment-local"),
-    client: {
-      server: {
-        subscribeAuthAccess: (listener: Parameters<typeof authAccessHarness.subscribe>[0]) =>
-          authAccessHarness.subscribe(listener),
+  };
+});
+
+vi.mock("../../lib/archivedThreadsState", () => ({
+  refreshArchivedThreadsForEnvironment: vi.fn(),
+  useArchivedThreadSnapshots: () => ({
+    snapshots: [],
+    error: null,
+    isLoading: false,
+    refresh: vi.fn(),
+  }),
+}));
+
+vi.mock("../../lib/sourceControlDiscoveryState", async () => {
+  const React = await import("react");
+  type Snapshot = {
+    readonly data: SourceControlDiscoveryResult | null;
+    readonly error: string | null;
+    readonly isPending: boolean;
+    readonly refresh: () => void;
+  };
+  type State = {
+    snapshot: Snapshot;
+    started: boolean;
+    readonly listeners: Set<() => void>;
+  };
+  const states = new WeakMap<LocalApi, State>();
+
+  const stateFor = (api: LocalApi): State => {
+    const existing = states.get(api);
+    if (existing) {
+      return existing;
+    }
+    const listeners = new Set<() => void>();
+    const state: State = {
+      started: false,
+      listeners,
+      snapshot: {
+        data: null,
+        error: null,
+        isPending: true,
+        refresh: () => {
+          state.started = false;
+          start(state, api);
+        },
       },
-    },
-    ensureBootstrapped: async () => undefined,
-    reconnect: async () => undefined,
-    dispose: async () => undefined,
+    };
+    states.set(api, state);
+    return state;
+  };
+
+  const publish = (state: State, next: Omit<Snapshot, "refresh">) => {
+    state.snapshot = {
+      ...next,
+      refresh: state.snapshot.refresh,
+    };
+    for (const listener of state.listeners) {
+      listener();
+    }
+  };
+
+  const start = (state: State, api: LocalApi) => {
+    if (state.started) {
+      return;
+    }
+    state.started = true;
+    publish(state, {
+      data: state.snapshot.data,
+      error: null,
+      isPending: true,
+    });
+    void api.server.discoverSourceControl().then(
+      (data) =>
+        publish(state, {
+          data,
+          error: null,
+          isPending: false,
+        }),
+      (error) =>
+        publish(state, {
+          data: state.snapshot.data,
+          error: error instanceof Error ? error.message : String(error),
+          isPending: false,
+        }),
+    );
   };
 
   return {
-    getEnvironmentHttpBaseUrl: () => "http://localhost:3000",
-    getSavedEnvironmentRecord: () => null,
-    getSavedEnvironmentRuntimeState: () => null,
-    hasSavedEnvironmentRegistryHydrated: () => true,
-    listSavedEnvironmentRecords: () => [],
-    resetSavedEnvironmentRegistryStoreForTests: () => undefined,
-    resetSavedEnvironmentRuntimeStoreForTests: () => undefined,
-    resolveEnvironmentHttpUrl: (_environmentId: unknown, path: string) =>
-      new URL(path, "http://localhost:3000").toString(),
-    waitForSavedEnvironmentRegistryHydration: async () => undefined,
-    addManagedRelayEnvironment: vi.fn(),
-    addSavedEnvironment: vi.fn(),
-    connectDesktopSshEnvironment: mockConnectDesktopSshEnvironment,
-    disconnectSavedEnvironment: vi.fn(),
-    ensureEnvironmentConnectionBootstrapped: async () => undefined,
-    getPrimaryEnvironmentConnection: () => primaryConnection,
-    readEnvironmentConnection: () => primaryConnection,
-    reconnectSavedEnvironment: vi.fn(),
-    removeSavedEnvironment: vi.fn(),
-    requireEnvironmentConnection: () => primaryConnection,
-    resetEnvironmentServiceForTests: () => undefined,
-    startEnvironmentConnectionService: () => undefined,
-    subscribeEnvironmentConnections: () => () => {},
-    useSavedEnvironmentRegistryStore: (
-      selector: (state: { byId: Record<string, never> }) => unknown,
-    ) => selector({ byId: {} }),
-    useSavedEnvironmentRuntimeStore: (
-      selector: (state: { byId: Record<string, never> }) => unknown,
-    ) => selector({ byId: {} }),
+    resetSourceControlDiscoveryStateForTests: () => undefined,
+    useSourceControlDiscovery: () => {
+      const api = window.nativeApi;
+      const state = React.useMemo(() => (api ? stateFor(api) : null), [api]);
+      const snapshot = React.useSyncExternalStore(
+        React.useCallback(
+          (listener) => {
+            state?.listeners.add(listener);
+            return () => {
+              state?.listeners.delete(listener);
+            };
+          },
+          [state],
+        ),
+        React.useCallback(
+          () =>
+            state?.snapshot ?? {
+              data: null,
+              error: null,
+              isPending: false,
+              refresh: () => undefined,
+            },
+          [state],
+        ),
+      );
+      React.useEffect(() => {
+        if (state && api) {
+          start(state, api);
+        }
+      }, [api, state]);
+      return snapshot;
+    },
+  };
+});
+
+vi.mock("../../connection/useWebEnvironmentData", async () => {
+  const React = await import("react");
+  const { useServerConfig } = await import("../../rpc/serverState");
+  const idleRefresh = async () => undefined;
+  const emptyQuery = {
+    data: null,
+    error: null,
+    isPending: false,
+    refresh: idleRefresh,
+  };
+  const useNativeQuery = <A,>(
+    load: () => Promise<A> | undefined,
+    dependencies: React.DependencyList,
+  ) => {
+    const [state, setState] = React.useState<{
+      readonly data: A | null;
+      readonly error: string | null;
+      readonly isPending: boolean;
+    }>({
+      data: null,
+      error: null,
+      isPending: true,
+    });
+    const refresh = React.useCallback(async () => {
+      setState((current) => ({ ...current, isPending: true }));
+      try {
+        const data = await load();
+        setState({
+          data: data ?? null,
+          error: null,
+          isPending: false,
+        });
+      } catch (error) {
+        setState({
+          data: null,
+          error: error instanceof Error ? error.message : String(error),
+          isPending: false,
+        });
+      }
+    }, dependencies);
+    React.useEffect(() => {
+      void refresh();
+    }, [refresh]);
+    return { ...state, refresh };
+  };
+
+  const useEmptyQuery = () => emptyQuery;
+  return {
+    useWebEnvironmentConnectionState: useEmptyQuery,
+    useWebEnvironmentConfig: useEmptyQuery,
+    useWebEnvironmentShell: useEmptyQuery,
+    useWebEnvironmentThread: useEmptyQuery,
+    useWebFilesystemBrowse: useEmptyQuery,
+    useWebProjectSearchEntries: useEmptyQuery,
+    useWebVcsListRefs: useEmptyQuery,
+    useWebVcsStatus: useEmptyQuery,
+    useWebReviewDiffPreview: useEmptyQuery,
+    useWebServerConfig: () => ({
+      ...emptyQuery,
+      data: useServerConfig(),
+    }),
+    useWebServerSettings: useEmptyQuery,
+    useWebSourceControlDiscovery: useEmptyQuery,
+    useWebTraceDiagnostics: (environmentId: EnvironmentId | null) =>
+      useNativeQuery(
+        () =>
+          environmentId === null
+            ? Promise.resolve(null)
+            : window.nativeApi?.server.getTraceDiagnostics(),
+        [environmentId],
+      ),
+    useWebProcessDiagnostics: (environmentId: EnvironmentId | null) =>
+      useNativeQuery(
+        () =>
+          environmentId === null
+            ? Promise.resolve(null)
+            : window.nativeApi?.server.getProcessDiagnostics(),
+        [environmentId],
+      ),
+    useWebProcessResourceHistory: (
+      target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: Parameters<LocalApi["server"]["getProcessResourceHistory"]>[0];
+      } | null,
+    ) =>
+      useNativeQuery(
+        () =>
+          target === null
+            ? Promise.resolve(null)
+            : window.nativeApi?.server.getProcessResourceHistory(target.input),
+        [target?.environmentId, target?.input.windowMs, target?.input.bucketMs],
+      ),
+    useWebSourceControlRepository: useEmptyQuery,
+    useWebPullRequestResolution: useEmptyQuery,
+    useWebTurnDiff: useEmptyQuery,
+    useWebFullThreadDiff: useEmptyQuery,
+    useWebArchivedShellSnapshot: useEmptyQuery,
+    useWebRelayClientStatus: useEmptyQuery,
+    useWebTerminalAttach: useEmptyQuery,
+    useWebTerminalEvents: useEmptyQuery,
+    useWebTerminalMetadata: useEmptyQuery,
+    useWebServerConfigChanges: useEmptyQuery,
+    useWebServerLifecycleChanges: useEmptyQuery,
+    useWebAuthAccessChanges: (environmentId: EnvironmentId | null) => {
+      const event = React.useSyncExternalStore(
+        authAccessHarness.subscribe,
+        authAccessHarness.getSnapshot,
+        authAccessHarness.getSnapshot,
+      );
+      return {
+        data: environmentId === null ? null : event,
+        error: null,
+        isPending: false,
+      };
+    },
+    useWebActions: () => ({
+      server: {
+        refreshProviders: mockRefreshProviders,
+        updateProvider: mockUpdateProvider,
+        signalProcess: async ({
+          input,
+        }: {
+          readonly input: Parameters<LocalApi["server"]["signalProcess"]>[0];
+        }) => window.nativeApi?.server.signalProcess(input),
+      },
+      shell: {
+        openInEditor: async ({
+          input,
+        }: {
+          readonly input: Parameters<LocalApi["shell"]["openInEditor"]>[0] extends never
+            ? never
+            : {
+                readonly cwd: string;
+                readonly editor: Parameters<LocalApi["shell"]["openInEditor"]>[1];
+              };
+        }) => window.nativeApi?.shell.openInEditor(input.cwd, input.editor),
+      },
+    }),
+    useWebEnvironmentConnectionActions: () => ({
+      register: vi.fn(),
+      remove: vi.fn(),
+      retryNow: vi.fn(),
+    }),
+    useWebRunStackedGitActionState: useEmptyQuery,
+    useWebEnvironmentActions: () => ({}),
+  };
+});
+
+vi.mock("../../connection/useWebEnvironments", async () => {
+  const React = await import("react");
+  const EffectOption = await import("effect/Option");
+  const { EnvironmentId: EnvironmentIdSchema } = await import("@t3tools/contracts");
+  const { useServerConfig } = await import("../../rpc/serverState");
+  const environmentId = EnvironmentIdSchema.make("environment-local");
+
+  const usePrimaryEnvironment = () => {
+    const serverConfig = useServerConfig();
+    return React.useMemo(
+      () => ({
+        environmentId,
+        label: "Local environment",
+        displayUrl: "http://localhost:3000",
+        relayManaged: false,
+        entry: {
+          target: {
+            _tag: "PrimaryConnectionTarget" as const,
+            environmentId,
+            label: "Local environment",
+            httpBaseUrl: "http://localhost:3000",
+            wsBaseUrl: "ws://localhost:3000",
+          },
+          profile: EffectOption.none(),
+        },
+        connection: {
+          phase: "connected" as const,
+          error: null,
+          traceId: null,
+        },
+        serverConfig,
+      }),
+      [serverConfig],
+    );
+  };
+
+  return {
+    useWebEnvironments: () => {
+      const primary = usePrimaryEnvironment();
+      return {
+        isReady: true,
+        networkStatus: "online" as const,
+        environments: [primary],
+        presentationById: new Map([[environmentId, primary]]),
+        shellStateById: new Map(),
+      };
+    },
+    useWebPrimaryEnvironment: usePrimaryEnvironment,
+    useWebRelayEnvironmentDiscovery: () => ({
+      environments: new Map(),
+      refreshing: false,
+      offline: false,
+      error: EffectOption.none(),
+    }),
+    useWebEnvironmentActions: () => ({
+      connectPairing: mockConnectPairingEnvironment,
+      connectSshEnvironment: mockConnectDesktopSshEnvironment,
+      connectRelayEnvironment: mockConnectRelayEnvironment,
+      removeEnvironment: mockRemoveEnvironment,
+      retryEnvironment: mockRetryEnvironment,
+      refreshRelayEnvironments: mockRefreshRelayEnvironments,
+    }),
+    useWebEnvironmentHttpBaseUrl: () => "http://localhost:3000",
   };
 });
 
@@ -898,10 +1222,10 @@ describe("GeneralSettingsPanel observability", () => {
     await expect.element(page.getByRole("checkbox", { name: /Operate tasks/ })).not.toBeChecked();
     await page.getByRole("button", { name: "Create link", exact: true }).click();
     authAccessHarness.emitPairingLinkUpserted(pairingLinks[0]!);
-    authAccessHarness.emitClientUpserted(clientSessions[1]!);
     await expect
       .element(page.getByRole("button", { name: "Pairing link scopes: show 1 scope" }))
       .toBeInTheDocument();
+    authAccessHarness.emitClientUpserted(clientSessions[1]!);
     await expect
       .element(page.getByText("Mobile · iOS · Safari · 192.168.1.88"))
       .toBeInTheDocument();
@@ -1082,15 +1406,15 @@ describe("GeneralSettingsPanel observability", () => {
       .click();
 
     await vi.waitFor(() => {
-      expect(mockConnectDesktopSshEnvironment).toHaveBeenCalledWith(
-        {
+      expect(mockConnectDesktopSshEnvironment).toHaveBeenCalledWith({
+        target: {
           alias: "devbox.example.com",
           hostname: "devbox.example.com",
           username: "julius",
           port: 2222,
         },
-        { label: "" },
-      );
+        label: "",
+      });
     });
   });
 

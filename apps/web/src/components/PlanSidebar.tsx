@@ -25,7 +25,7 @@ import {
   stripDisplayedPlanMarkdown,
 } from "../proposedPlan";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./ui/menu";
-import { readEnvironmentApi } from "~/environmentApi";
+import { useWebActions } from "~/connection/useWebEnvironmentData";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 
@@ -76,6 +76,7 @@ const PlanSidebar = memo(function PlanSidebar({
 }: PlanSidebarProps) {
   const [proposedPlanExpanded, setProposedPlanExpanded] = useState(false);
   const [isSavingToWorkspace, setIsSavingToWorkspace] = useState(false);
+  const actions = useWebActions();
   const { copyToClipboard, isCopied } = useCopyToClipboard();
 
   const planMarkdown = activeProposedPlan?.planMarkdown ?? null;
@@ -94,15 +95,17 @@ const PlanSidebar = memo(function PlanSidebar({
   }, [planMarkdown]);
 
   const handleSaveToWorkspace = useCallback(() => {
-    const api = readEnvironmentApi(environmentId);
-    if (!api || !workspaceRoot || !planMarkdown) return;
+    if (!workspaceRoot || !planMarkdown) return;
     const filename = buildProposedPlanMarkdownFilename(planMarkdown);
     setIsSavingToWorkspace(true);
-    void api.projects
+    void actions.projects
       .writeFile({
-        cwd: workspaceRoot,
-        relativePath: filename,
-        contents: normalizePlanMarkdownForExport(planMarkdown),
+        environmentId,
+        input: {
+          cwd: workspaceRoot,
+          relativePath: filename,
+          contents: normalizePlanMarkdownForExport(planMarkdown),
+        },
       })
       .then((result) => {
         toastManager.add({
@@ -124,7 +127,7 @@ const PlanSidebar = memo(function PlanSidebar({
         () => setIsSavingToWorkspace(false),
         () => setIsSavingToWorkspace(false),
       );
-  }, [environmentId, planMarkdown, workspaceRoot]);
+  }, [actions.projects, environmentId, planMarkdown, workspaceRoot]);
 
   return (
     <div

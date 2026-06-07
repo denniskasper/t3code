@@ -2,14 +2,10 @@ import { scopeProjectRef, scopedThreadKey, scopeThreadRef } from "@t3tools/clien
 import type { VcsStatusResult } from "@t3tools/contracts";
 import { CloudIcon, GitPullRequestIcon, TerminalIcon } from "lucide-react";
 import { useMemo } from "react";
-import { usePrimaryEnvironmentId } from "../environments/primary";
-import {
-  useSavedEnvironmentRegistryStore,
-  useSavedEnvironmentRuntimeStore,
-} from "../environments/runtime";
+import { useWebEnvironments, useWebPrimaryEnvironment } from "../connection/useWebEnvironments";
 import { useVcsStatus } from "../lib/vcsStatusState";
 import { type AppState, selectProjectByRef, useStore } from "../store";
-import { useThreadRunningTerminalIds } from "../terminalSessionState";
+import { useWebThreadRunningTerminalIds as useThreadRunningTerminalIds } from "../connection/webTerminalSessions";
 import { useUiStateStore } from "../uiStateStore";
 import { resolveChangeRequestPresentation } from "../sourceControlPresentation";
 import { resolveThreadStatusPill, type ThreadStatusPill } from "./Sidebar.logic";
@@ -199,18 +195,14 @@ export function ThreadRowTrailingStatus({ thread }: { thread: SidebarThreadSumma
     environmentId: thread.environmentId,
     threadId: thread.id,
   });
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const { environments } = useWebEnvironments();
+  const primaryEnvironmentId = useWebPrimaryEnvironment()?.environmentId ?? null;
   const isRemoteThread =
     primaryEnvironmentId !== null && thread.environmentId !== primaryEnvironmentId;
-  const remoteEnvLabel = useSavedEnvironmentRuntimeStore(
-    (state) => state.byId[thread.environmentId]?.descriptor?.label ?? null,
-  );
-  const remoteEnvSavedLabel = useSavedEnvironmentRegistryStore(
-    (state) => state.byId[thread.environmentId]?.label ?? null,
-  );
-  const threadEnvironmentLabel = isRemoteThread
-    ? (remoteEnvLabel ?? remoteEnvSavedLabel ?? "Remote")
-    : null;
+  const remoteEnvLabel =
+    environments.find((environment) => environment.environmentId === thread.environmentId)?.label ??
+    null;
+  const threadEnvironmentLabel = isRemoteThread ? (remoteEnvLabel ?? "Remote") : null;
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
 
   if (!terminalStatus && !isRemoteThread) {

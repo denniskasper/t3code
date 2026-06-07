@@ -108,7 +108,7 @@ export const EMPTY_TERMINAL_SESSION_STATE = Object.freeze<TerminalSessionState>(
 
 const EMPTY_KNOWN_TERMINAL_SESSIONS = Object.freeze<Array<KnownTerminalSession>>([]);
 const EMPTY_TERMINAL_ID_LIST = Object.freeze<Array<string>>([]);
-const DEFAULT_MAX_BUFFER_BYTES = 512 * 1024;
+export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 512 * 1024;
 const knownTerminalMetadataEnvironmentIds = new Set<EnvironmentId>();
 const knownTerminalBufferTargets = new Map<string, KnownTerminalSessionTarget>();
 const textEncoder = new TextEncoder();
@@ -223,7 +223,7 @@ function trimBufferToBytes(buffer: string, maxBufferBytes: number): string {
   return textDecoder.decode(encoded.subarray(start));
 }
 
-function bufferFromSnapshot(
+export function terminalBufferStateFromSnapshot(
   snapshot: TerminalSessionSnapshot,
   maxBufferBytes: number,
 ): TerminalBufferState {
@@ -242,19 +242,90 @@ function latestTimestamp(left: string | null, right: string | null): string | nu
   return Date.parse(left) >= Date.parse(right) ? left : right;
 }
 
-function combineSessionState(
+export function combineTerminalSessionState(
   summary: TerminalSummary | null,
   buffer: TerminalBufferState,
 ): TerminalSessionState {
   return {
     summary,
     buffer: buffer.buffer,
-    status: summary?.status ?? buffer.status,
+    status: buffer.version > 0 ? buffer.status : (summary?.status ?? buffer.status),
     error: buffer.error,
     hasRunningSubprocess: summary?.hasRunningSubprocess ?? false,
     updatedAt: latestTimestamp(summary?.updatedAt ?? null, buffer.updatedAt),
     version: buffer.version,
   };
+}
+
+export function applyTerminalAttachStreamEvent(
+  current: TerminalBufferState,
+  event: TerminalAttachStreamEvent,
+  maxBufferBytes = DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
+): TerminalBufferState {
+  switch (event.type) {
+    case "snapshot":
+    case "restarted":
+      return terminalBufferStateFromSnapshot(event.snapshot, maxBufferBytes);
+    case "output":
+      return {
+        ...current,
+        buffer: trimBufferToBytes(`${current.buffer}${event.data}`, maxBufferBytes),
+        status: current.status === "closed" ? "running" : current.status,
+        error: null,
+        version: current.version + 1,
+      };
+    case "cleared":
+      return {
+        ...current,
+        buffer: "",
+        error: null,
+        version: current.version + 1,
+      };
+    case "exited":
+      return {
+        ...current,
+        status: "exited",
+        error: null,
+        version: current.version + 1,
+      };
+    case "closed":
+      return {
+        ...current,
+        status: "closed",
+        error: null,
+        version: current.version + 1,
+      };
+    case "error":
+      return {
+        ...current,
+        status: "error",
+        error: event.message,
+        version: current.version + 1,
+      };
+    case "activity":
+      return current;
+  }
+}
+
+export function applyTerminalMetadataStreamEvent(
+  current: ReadonlyArray<TerminalSummary>,
+  event: TerminalMetadataStreamEvent,
+): ReadonlyArray<TerminalSummary> {
+  if (event.type === "snapshot") {
+    return event.terminals;
+  }
+  if (event.type === "remove") {
+    return current.filter(
+      (terminal) =>
+        terminal.threadId !== event.threadId || terminal.terminalId !== event.terminalId,
+    );
+  }
+  const next = current.filter(
+    (terminal) =>
+      terminal.threadId !== event.terminal.threadId ||
+      terminal.terminalId !== event.terminal.terminalId,
+  );
+  return [...next, event.terminal];
 }
 
 function listKnownSessionsFromMetadata(
@@ -276,7 +347,7 @@ function listKnownSessionsFromMetadata(
       }
       return Result.succeed({
         target,
-        state: combineSessionState(summary, getBuffer(target)),
+        state: combineTerminalSessionState(summary, getBuffer(target)),
       });
     }),
     Arr.sort(knownTerminalSessionOrder),
@@ -286,7 +357,7 @@ function listKnownSessionsFromMetadata(
 export const terminalSessionStateAtom = Atom.family((target: KnownTerminalSessionTarget) =>
   Atom.make((get) => {
     const targetKey = keyFromKnownTarget(target);
-    return combineSessionState(
+    return combineTerminalSessionState(
       get(terminalSessionMetadataAtom(target.environmentId))[targetKey]?.summary ?? null,
       get(terminalSessionBufferAtom(target)),
     );
@@ -328,7 +399,7 @@ export const runningTerminalIdsAtom = Atom.family((filter: KnownTerminalSessionL
 );
 
 export function createTerminalSessionManager(config: TerminalSessionManagerConfig) {
-  const maxBufferBytes = config.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
+  const maxBufferBytes = config.maxBufferBytes ?? DEFAULT_MAX_TERMINAL_BUFFER_BYTES;
 
   function getMetadata(environmentId: EnvironmentId): Record<string, KnownTerminalMetadata> {
     return config.getRegistry().get(terminalSessionMetadataAtom(environmentId));
@@ -355,7 +426,7 @@ export function createTerminalSessionManager(config: TerminalSessionManagerConfi
       return EMPTY_TERMINAL_SESSION_STATE;
     }
 
-    return combineSessionState(
+    return combineTerminalSessionState(
       getMetadata(knownTarget.environmentId)[keyFromKnownTarget(knownTarget)]?.summary ?? null,
       getBuffer(knownTarget),
     );
@@ -374,7 +445,7 @@ export function createTerminalSessionManager(config: TerminalSessionManagerConfi
       return;
     }
 
-    setBuffer(knownTarget, bufferFromSnapshot(snapshot, maxBufferBytes));
+    setBuffer(knownTarget, terminalBufferStateFromSnapshot(snapshot, maxBufferBytes));
   }
 
   function applyMetadataEvent(
@@ -458,7 +529,7 @@ export function createTerminalSessionManager(config: TerminalSessionManagerConfi
     const current = getBuffer(knownTarget);
     switch (event.type) {
       case "restarted":
-        setBuffer(knownTarget, bufferFromSnapshot(event.snapshot, maxBufferBytes));
+        setBuffer(knownTarget, terminalBufferStateFromSnapshot(event.snapshot, maxBufferBytes));
         return;
       case "output":
         setBuffer(knownTarget, {

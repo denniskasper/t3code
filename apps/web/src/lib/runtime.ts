@@ -2,8 +2,10 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import type * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { FetchHttpClient } from "effect/unstable/http";
+import * as Socket from "effect/unstable/socket/Socket";
 
 import { remoteHttpClientLayer } from "@t3tools/client-runtime";
+import { httpHeaderRedactionLayer } from "@t3tools/shared/httpObservability";
 import {
   PrimaryEnvironmentHttpClient,
   primaryEnvironmentHttpClientLive,
@@ -28,6 +30,7 @@ const primaryHttpRuntime = ManagedRuntime.make(
       Layer.mergeAll(
         remoteHttpClientLayer((input, init) => globalThis.fetch(input, init)),
         Layer.succeed(FetchHttpClient.RequestInit, primaryEnvironmentRequestInit),
+        httpHeaderRedactionLayer,
       ),
     ),
   ),
@@ -49,12 +52,13 @@ export function __setPrimaryHttpRunnerForTests(runner?: PrimaryHttpEffectRunner)
   primaryHttpRunner = runner ?? livePrimaryHttpRunner;
 }
 
-export const webRuntime = ManagedRuntime.make(
-  Layer.mergeAll(
-    webHttpClientLayer,
-    browserCryptoLayer,
-    webManagedRelayClientLayer(configuredRelayUrl()).pipe(
-      Layer.provide(Layer.mergeAll(webHttpClientLayer, browserCryptoLayer)),
-    ),
+export const webRuntimeLayer = Layer.mergeAll(
+  webHttpClientLayer,
+  browserCryptoLayer,
+  Socket.layerWebSocketConstructorGlobal,
+  webManagedRelayClientLayer(configuredRelayUrl()).pipe(
+    Layer.provide(Layer.mergeAll(webHttpClientLayer, browserCryptoLayer)),
   ),
 );
+
+export const webRuntime = ManagedRuntime.make(webRuntimeLayer);

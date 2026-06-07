@@ -1,7 +1,7 @@
 import "../index.css";
 
 import { scopeThreadRef } from "@t3tools/client-runtime";
-import { ThreadId, type TerminalAttachStreamEvent } from "@t3tools/contracts";
+import { ThreadId } from "@t3tools/contracts";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { render } from "vitest-browser-react";
 
@@ -10,26 +10,34 @@ const {
   terminalDisposeSpy,
   fitAddonFitSpy,
   fitAddonLoadSpy,
-  environmentApiById,
-  readEnvironmentApiMock,
+  terminalControllerByEnvironmentId,
+  useWebTerminalControllerMock,
   readLocalApiMock,
 } = vi.hoisted(() => ({
   terminalConstructorSpy: vi.fn(),
   terminalDisposeSpy: vi.fn(),
   fitAddonFitSpy: vi.fn(),
   fitAddonLoadSpy: vi.fn(),
-  environmentApiById: new Map<
+  terminalControllerByEnvironmentId: new Map<
     string,
     {
-      terminal: {
-        open: ReturnType<typeof vi.fn>;
-        attach: ReturnType<typeof vi.fn>;
-        write: ReturnType<typeof vi.fn>;
-        resize: ReturnType<typeof vi.fn>;
+      session: {
+        summary: null;
+        buffer: string;
+        status: "running";
+        error: null;
+        hasRunningSubprocess: false;
+        updatedAt: null;
+        version: number;
       };
+      write: ReturnType<typeof vi.fn>;
+      resize: ReturnType<typeof vi.fn>;
+      clear: ReturnType<typeof vi.fn>;
+      restart: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
     }
   >(),
-  readEnvironmentApiMock: vi.fn((environmentId: string) => environmentApiById.get(environmentId)),
+  useWebTerminalControllerMock: vi.fn(),
   readLocalApiMock: vi.fn<
     () =>
       | {
@@ -118,8 +126,23 @@ vi.mock("@xterm/xterm", () => ({
   },
 }));
 
-vi.mock("~/environmentApi", () => ({
-  readEnvironmentApi: readEnvironmentApiMock,
+vi.mock("../connection/webTerminalSessions", () => ({
+  useWebTerminalController: (input: { environmentId: string }) => {
+    useWebTerminalControllerMock(input);
+    const controller = terminalControllerByEnvironmentId.get(input.environmentId);
+    if (controller === undefined) {
+      throw new Error(`Missing test terminal controller for ${input.environmentId}`);
+    }
+    return controller;
+  },
+}));
+
+vi.mock("../connection/useWebEnvironmentData", () => ({
+  useWebServerConfig: () => ({
+    data: { availableEditors: [] },
+    error: null,
+    isLoading: false,
+  }),
 }));
 
 vi.mock("~/localApi", () => ({
@@ -133,37 +156,22 @@ import { TerminalViewport } from "./ThreadTerminalDrawer";
 
 const THREAD_ID = ThreadId.make("thread-terminal-browser");
 
-function createEnvironmentApi() {
-  const snapshot = {
-    threadId: THREAD_ID,
-    terminalId: "term-1",
-    cwd: "/repo/project",
-    worktreePath: null,
-    status: "running" as const,
-    pid: 123,
-    history: "",
-    exitCode: null,
-    exitSignal: null,
-    label: "Terminal 1",
-    updatedAt: "2026-04-07T00:00:00.000Z",
-  };
-
+function createTerminalController() {
   return {
-    terminal: {
-      open: vi.fn(async () => snapshot),
-      attach: vi.fn(
-        (
-          _input: unknown,
-          listener: (event: TerminalAttachStreamEvent) => void,
-          _options?: unknown,
-        ) => {
-          listener({ type: "snapshot", snapshot });
-          return vi.fn();
-        },
-      ),
-      write: vi.fn(async () => undefined),
-      resize: vi.fn(async () => undefined),
+    session: {
+      summary: null,
+      buffer: "",
+      status: "running" as const,
+      error: null,
+      hasRunningSubprocess: false as const,
+      updatedAt: null,
+      version: 1,
     },
+    write: vi.fn(async () => undefined),
+    resize: vi.fn(async () => undefined),
+    clear: vi.fn(async () => undefined),
+    restart: vi.fn(async () => undefined),
+    close: vi.fn(async () => undefined),
   };
 }
 
@@ -239,8 +247,8 @@ async function mountTerminalViewport(props: {
 
 describe("TerminalViewport", () => {
   afterEach(() => {
-    environmentApiById.clear();
-    readEnvironmentApiMock.mockClear();
+    terminalControllerByEnvironmentId.clear();
+    useWebTerminalControllerMock.mockClear();
     readLocalApiMock.mockClear();
     terminalConstructorSpy.mockClear();
     terminalDisposeSpy.mockClear();
@@ -248,8 +256,8 @@ describe("TerminalViewport", () => {
     fitAddonLoadSpy.mockClear();
   });
 
-  it("does not create a terminal when APIs are unavailable", async () => {
-    readEnvironmentApiMock.mockReturnValueOnce(undefined);
+  it("renders the terminal through the shared terminal controller without the desktop API", async () => {
+    terminalControllerByEnvironmentId.set("environment-a", createTerminalController());
     readLocalApiMock.mockReturnValueOnce(undefined);
 
     const mounted = await mountTerminalViewport({
@@ -258,25 +266,9 @@ describe("TerminalViewport", () => {
 
     try {
       await vi.waitFor(() => {
-        expect(terminalConstructorSpy).not.toHaveBeenCalled();
-      });
-    } finally {
-      await mounted.cleanup();
-    }
-  });
-
-  it("renders and attaches the terminal without the desktop local API", async () => {
-    const environment = createEnvironmentApi();
-    environmentApiById.set("environment-a", environment);
-    readLocalApiMock.mockReturnValueOnce(undefined);
-
-    const mounted = await mountTerminalViewport({
-      threadRef: scopeThreadRef("environment-a" as never, THREAD_ID),
-    });
-
-    try {
-      await vi.waitFor(() => {
-        expect(environment.terminal.attach).toHaveBeenCalledTimes(1);
+        expect(useWebTerminalControllerMock).toHaveBeenCalledWith(
+          expect.objectContaining({ environmentId: "environment-a" }),
+        );
       });
       expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
     } finally {
@@ -285,8 +277,7 @@ describe("TerminalViewport", () => {
   });
 
   it("keeps the terminal mounted when xterm fit runs before dimensions are ready", async () => {
-    const environment = createEnvironmentApi();
-    environmentApiById.set("environment-a", environment);
+    terminalControllerByEnvironmentId.set("environment-a", createTerminalController());
     fitAddonFitSpy.mockImplementationOnce(() => {
       throw new TypeError("Cannot read properties of undefined (reading 'dimensions')");
     });
@@ -297,9 +288,8 @@ describe("TerminalViewport", () => {
 
     try {
       await vi.waitFor(() => {
-        expect(environment.terminal.attach).toHaveBeenCalledTimes(1);
+        expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       });
-      expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       expect(fitAddonFitSpy).toHaveBeenCalled();
     } finally {
       await mounted.cleanup();
@@ -307,10 +297,8 @@ describe("TerminalViewport", () => {
   });
 
   it("reattaches the terminal when the scoped thread reference changes", async () => {
-    const environmentA = createEnvironmentApi();
-    const environmentB = createEnvironmentApi();
-    environmentApiById.set("environment-a", environmentA);
-    environmentApiById.set("environment-b", environmentB);
+    terminalControllerByEnvironmentId.set("environment-a", createTerminalController());
+    terminalControllerByEnvironmentId.set("environment-b", createTerminalController());
 
     const mounted = await mountTerminalViewport({
       threadRef: scopeThreadRef("environment-a" as never, THREAD_ID),
@@ -318,7 +306,7 @@ describe("TerminalViewport", () => {
 
     try {
       await vi.waitFor(() => {
-        expect(environmentA.terminal.attach).toHaveBeenCalledTimes(1);
+        expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       });
 
       await mounted.rerender({
@@ -326,17 +314,19 @@ describe("TerminalViewport", () => {
       });
 
       await vi.waitFor(() => {
-        expect(environmentB.terminal.attach).toHaveBeenCalledTimes(1);
+        expect(useWebTerminalControllerMock).toHaveBeenCalledWith(
+          expect.objectContaining({ environmentId: "environment-b" }),
+        );
       });
       expect(terminalDisposeSpy).toHaveBeenCalledTimes(1);
+      expect(terminalConstructorSpy).toHaveBeenCalledTimes(2);
     } finally {
       await mounted.cleanup();
     }
   });
 
   it("does not reattach the terminal when the scoped thread reference values stay the same", async () => {
-    const environment = createEnvironmentApi();
-    environmentApiById.set("environment-a", environment);
+    terminalControllerByEnvironmentId.set("environment-a", createTerminalController());
 
     const mounted = await mountTerminalViewport({
       threadRef: scopeThreadRef("environment-a" as never, THREAD_ID),
@@ -344,16 +334,14 @@ describe("TerminalViewport", () => {
 
     try {
       await vi.waitFor(() => {
-        expect(environment.terminal.attach).toHaveBeenCalledTimes(1);
+        expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       });
 
       await mounted.rerender({
         threadRef: scopeThreadRef("environment-a" as never, THREAD_ID),
       });
 
-      await vi.waitFor(() => {
-        expect(environment.terminal.attach).toHaveBeenCalledTimes(1);
-      });
+      expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       expect(terminalDisposeSpy).not.toHaveBeenCalled();
     } finally {
       await mounted.cleanup();
@@ -361,8 +349,7 @@ describe("TerminalViewport", () => {
   });
 
   it("does not reattach when runtime env contents are unchanged but object identity changes", async () => {
-    const environment = createEnvironmentApi();
-    environmentApiById.set("environment-a", environment);
+    terminalControllerByEnvironmentId.set("environment-a", createTerminalController());
 
     const mounted = await mountTerminalViewport({
       threadRef: scopeThreadRef("environment-a" as never, THREAD_ID),
@@ -371,7 +358,7 @@ describe("TerminalViewport", () => {
 
     try {
       await vi.waitFor(() => {
-        expect(environment.terminal.attach).toHaveBeenCalledTimes(1);
+        expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       });
 
       await mounted.rerender({
@@ -379,9 +366,7 @@ describe("TerminalViewport", () => {
         runtimeEnv: { T3: "1", PATH: "/usr/bin" },
       });
 
-      await vi.waitFor(() => {
-        expect(environment.terminal.attach).toHaveBeenCalledTimes(1);
-      });
+      expect(terminalConstructorSpy).toHaveBeenCalledTimes(1);
       expect(terminalDisposeSpy).not.toHaveBeenCalled();
     } finally {
       await mounted.cleanup();
@@ -389,8 +374,7 @@ describe("TerminalViewport", () => {
   });
 
   it("uses the drawer surface colors for the terminal theme", async () => {
-    const environment = createEnvironmentApi();
-    environmentApiById.set("environment-a", environment);
+    terminalControllerByEnvironmentId.set("environment-a", createTerminalController());
 
     const mounted = await mountTerminalViewport({
       threadRef: scopeThreadRef("environment-a" as never, THREAD_ID),
